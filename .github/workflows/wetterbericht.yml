@@ -1,0 +1,48 @@
+name: Wetterbericht Riederalp
+
+on:
+  schedule:
+    - cron: "40 4 * * *"
+    - cron: "40 15 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: wetterbericht
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: cache
+          key: klima-era5land-${{ github.run_id }}
+          restore-keys: klima-era5land-
+      - name: Bericht erzeugen
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          EXTRA=""
+          if [ -n "$ANTHROPIC_API_KEY" ]; then EXTRA="--claude"; fi
+          python3 wetterbericht.py --out site --cache cache $EXTRA
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
