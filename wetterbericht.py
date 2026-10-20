@@ -15,6 +15,8 @@ Datenquellen (alle über Open-Meteo, kein API-Key nötig)
   * Druckflächen Europa: ECMWF IFS 0,25°
   * Klimatologie: ERA5-Land 1991–2020 (wird lokal gecacht)
   * Aerosol: CAMS (Saharastaub)
+  * Schnee: Schneefallgrenze, Neuschnee (fester Faktor und Dichte nach Anderson 1976),
+    Modellschneehöhe, jeweils mit Ensemble-Wahrscheinlichkeiten
 
 Nur Python-Standardbibliothek (>= 3.9).
 
@@ -42,7 +44,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-VERSION = "1.0"
+VERSION = "1.1"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -145,8 +147,9 @@ ENSEMBLES = [
 HOURLY_LOCAL = ["temperature_2m", "relative_humidity_2m", "precipitation", "snowfall",
                 "cloud_cover", "cloud_cover_low", "pressure_msl", "wind_speed_10m",
                 "wind_direction_10m", "wind_gusts_10m", "freezing_level_height",
-                "snowfall_height", "sunshine_duration", "cape"]
-ENS_VARS = ["temperature_2m", "precipitation", "snowfall", "cloud_cover_low"]
+                "snowfall_height", "sunshine_duration", "cape", "snow_depth"]
+ENS_VARS = ["temperature_2m", "precipitation", "snowfall", "cloud_cover_low", "snowfall_height", "snow_depth"]
+SNOW_TABLE = ["moerel", "simplon", "zermatt", "riederalp", "grimsel", "moosfluh"]  # nach Höhe
 PAUSE_ENS = 8  # Ensemble-Aufrufe sind teuer (Member × Variablen); Minutenlimit schonen
 UPPER_VARS = ["pressure_msl", "geopotential_height_500hPa", "temperature_850hPa",
               "wind_speed_250hPa", "temperature_700hPa", "relative_humidity_700hPa",
@@ -507,6 +510,12 @@ def when(hours):
 
 
 # ============================================================ Diagnostik
+def new_snow_density(t):
+    """Neuschneedichte in kg/m³ nach Anderson (1976), wie im Schneemodell SNOW-17."""
+    t = min(t, 0.0)
+    return 50.0 if t <= -15 else 50.0 + 1.7 * (t + 15) ** 1.5
+
+
 def summarize_day(rec, d, lat):
     ii = rec["idx"].get(d, [])
     v, t = rec["v"], rec["t"]
@@ -523,6 +532,7 @@ def summarize_day(rec, d, lat):
     W, Wd, G = g("wind_speed_10m"), g("wind_direction_10m"), g("wind_gusts_10m")
     F, SF, SUN = g("freezing_level_height"), g("snowfall_height"), g("sunshine_duration")
     CAPE, PM, RH = g("cape"), g("pressure_msl"), g("relative_humidity_2m")
+    SD = g("snow_depth")
 
     def at(arr, h):
         for x, hh in zip(arr, hrs):
@@ -539,7 +549,21 @@ def summarize_day(rec, d, lat):
     wdir, wspd = vec_mean(sel(W, day), sel(Wd, day))
     sun = valid(SUN)
     sfw = valid(sel(SF, wet))
+    snow_k = [k for k, x in enumerate(S) if x is not None and x > 0.05]
+    hn_dens, wsum, tsum = 0.0, 0.0, 0.0
+    for k in snow_k:
+        tk = T[k] if T[k] is not None else 0.0
+        hn_dens += (S[k] / 0.7) / new_snow_density(tk) * 100  # mm Wasserwert -> cm
+        wsum += S[k]
+        tsum += tk * S[k]
+    sd_valid = [x for x in SD if x is not None]
+    sd07 = at(SD, 7)
     return {
+        "sfh_med": quant(sfw, .5) if sfw else None, "sfh_max": max(sfw) if sfw else None,
+        "sfh_day": quant(valid(SF), .5) if valid(SF) else None,
+        "hn_dens": hn_dens, "t_snow": tsum / wsum if wsum > 0 else None,
+        "sd07": sd07 * 100 if sd07 is not None else None,
+        "sd_end": sd_valid[-1] * 100 if sd_valid else None,
         "tmin": min(valid(T)), "tmax": max(valid(T)), "t07": at(T, 7), "t15": at(T, 15),
         "prec": sum(valid(P)), "snow": sum(valid(S)),
         "sun_h": sum(sun) / 3600 if len(sun) >= 20 else None,
@@ -579,10 +603,50 @@ def ens_day_stats(rec, d, min_hours=20):
     prec = per_member("precipitation", sum)
     snow = per_member("snowfall", sum)
     lowm = per_member("cloud_cover_low", lambda v: sum(v) / len(v), sub=lambda h: 7 <= h <= 11, need=3)
-    return {"n": len(tmax), "tmax": qstats(tmax), "tmin": qstats(per_member("temperature_2m", min)),
+    sfh_vals, nmem = [], len(tmax)
+    for parr, harr in zip(members(rec, "precipitation"), members(rec, "snowfall_height")):
+        hv = [harr[i] for i in ii if i < len(parr) and i < len(harr) and parr[i] is not None
+              and parr[i] >= 0.2 and harr[i] is not None]
+        if hv:
+            sfh_vals.append(quant(hv, .5))
+    sd = per_member("snow_depth", lambda v: v[-1] * 100)
+    return {"sfh": qstats(sfh_vals) if len(sfh_vals) >= 3 else None, "p_wet": len(sfh_vals) / nmem,
+            "psnow1": frac(snow, 1.0), "psnow10": frac(snow, 10.0), "sd": qstats(sd), "psd5": frac(sd, 5.0),"n": len(tmax), "tmax": qstats(tmax), "tmin": qstats(per_member("temperature_2m", min)),
             "prec": qstats(prec), "p1": frac(prec, 1.0), "p10": frac(prec, 10.0),
             "p30": frac(prec, 30.0), "psnow5": frac(snow, 5.0), "snow": qstats(snow),
             "plow": frac(lowm, 80.0)}
+
+
+def ens_period_snow(rec, days):
+    """Neuschneesumme pro Member über den ganzen Berichtszeitraum."""
+    ii = [i for d in days for i in rec["idx"].get(d, [])]
+    sums = []
+    for arr in members(rec, "snowfall"):
+        vv = [arr[i] for i in ii if i < len(arr)]
+        if len(valid(vv)) >= 0.9 * len(ii):
+            sums.append(sum(valid(vv)))
+    return qstats(sums) if len(sums) >= 5 else None
+
+
+def merged_series(D, loc, variables):
+    """Stundenreihe eines Orts: ICON-CH, wo vorhanden, sonst IFS."""
+    recs = [(lab, parsed[loc]) for lab, _mid, parsed in D["primary"] if loc in parsed]
+    if not recs:
+        return None
+    times = sorted({t for _, r in recs for t in r["t"]})
+    out = {"t": times, "src": [], **{v: [] for v in variables}}
+    for t in times:
+        pick = None
+        for lab, r in recs:
+            i = r["tidx"].get(t)
+            if i is not None and (r["v"].get("temperature_2m") or [None])[i] is not None:
+                pick = (lab, r, i)
+                break
+        out["src"].append(pick[0] if pick else None)
+        for v in variables:
+            arr = pick[1]["v"].get(v) if pick else None
+            out[v].append(arr[pick[2]] if arr and pick[2] < len(arr) else None)
+    return out
 
 
 def ens_hourly_quantiles(rec, var="temperature_2m"):
@@ -749,6 +813,18 @@ def diagnose(D, days, now):
                 break
         if X["ens_hourly"]:
             break
+    X["series"] = merged_series(D, "riederalp", ["snowfall_height", "freezing_level_height", "precipitation",
+                                                  "snowfall", "snow_depth"])
+    X["ens_sfh"], X["snow_period"] = None, {}
+    for label, mid, parsed in D["ens"]:
+        if "riederalp" in parsed:
+            sp = ens_period_snow(parsed["riederalp"], days)
+            if sp:
+                X["snow_period"][label] = sp
+            if X["ens_sfh"] is None and label in ("ECMWF ENS", "NOAA GEFS"):
+                tq = ens_hourly_quantiles(parsed["riederalp"], "snowfall_height")
+                if valid(tq[1][50]):
+                    X["ens_sfh"] = (label, *tq)
     X["det_hourly"] = {label: (parsed["riederalp"]["t"], parsed["riederalp"]["v"].get("temperature_2m"))
                        for label, mid, parsed in D["primary"] if "riederalp" in parsed}
     # Modellvergleich Riederalp
@@ -895,7 +971,7 @@ def prec_kind(s):
     return base
 
 
-def prec_sentence(s, ens=None, sfh=True, place=None):
+def prec_sentence(s, ens=None, sfh=True, place=None, snow=True):
     p = s["prec"]
     pe = ens.get("p1") if ens else None
     if p < 0.3:
@@ -903,15 +979,76 @@ def prec_sentence(s, ens=None, sfh=True, place=None):
             return f"Im Hauptlauf trocken, im Ensemble aber {pct(pe)} Wahrscheinlichkeit für mindestens 1 mm."
         return ""
     out = f"{cap(prec_kind(s))} {s['when']}, {place or 'im Hauptlauf'} {n(p, 1)} mm"
-    if s["snow"] >= 1:
+    if snow and s["snow"] >= 1:
         out += f" (davon rund {n(s['snow'])} cm Neuschnee)"
     out += "."
     if ens and ens.get("prec"):
         out += (f" Ensemble: {pct(pe)} für ≥ 1 mm, Median {n(ens['prec']['p50'], 1)} mm, "
                 f"90-%-Quantil {n(ens['prec']['p90'], 1)} mm.")
-    if sfh and s.get("sfh_wet") is not None:
-        out += f" Schneefallgrenze um {hm(s['sfh_wet'])}."
+    if sfh and s.get("sfh_med") is not None:
+        out += f" Schneefallgrenze um {hm(s['sfh_med'])}."
     return out
+
+
+def melt_cooling(s):
+    """Schneefallgrenze weit unter der Nullgradgrenze bei kräftigem Niederschlag."""
+    if s.get("sfh_med") is None or s.get("fzl_mean") is None or s["prec"] < 8:
+        return None
+    gap = s["fzl_mean"] - s["sfh_med"]
+    return gap if gap >= 500 else None
+
+
+def snow_text(s, e, elev, name):
+    es = e[1] if e else None
+    out = []
+    if s["prec"] >= 0.3 and s.get("sfh_med") is not None:
+        t = f"Schneefallgrenze während des Niederschlags um {hm(s['sfh_med'])}"
+        if s.get("sfh_wet") is not None and s.get("sfh_max") is not None and s["sfh_max"] - s["sfh_wet"] >= 300:
+            t += f" (zwischen {hm(s['sfh_wet'])} und {hm(s['sfh_max'])})"
+        rel = s["sfh_med"] - elev
+        if rel <= -150:
+            t += f", auf der {name} fällt Schnee"
+        elif rel < 150:
+            t += f", also etwa auf Höhe der {name}: nasser Schnee oder Schneeregen"
+        else:
+            t += f", auf der {name} Regen"
+        t += "."
+        if es and es.get("sfh"):
+            t += (f" {e[0]}: 10–90 % der nassen Member zwischen {hm(es['sfh']['p10'])} und "
+                  f"{hm(es['sfh']['p90'])}.")
+        out.append(t)
+        gap = melt_cooling(s)
+        if gap:
+            out.append(f"Die Schneefallgrenze liegt {hm(gap)} unter der Nullgradgrenze, deutlich mehr als die "
+                       "üblichen rund 300 m: Schmelzen und Verdunsten im kräftigen Niederschlag kühlen die Luft, "
+                       "die Grenze kann dann rascher sinken als die Nullgradgrenze.")
+    elif s.get("sfh_day") is not None:
+        out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge im Modell um {hm(s['sfh_day'])}.")
+    elif s.get("fzl_mean") is not None:
+        out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge nach Faustregel "
+                   f"(Nullgradgrenze minus 300 m) um {hm(s['fzl_mean'] - 300)}.")
+    ps1 = es.get("psnow1") if es else None
+    if s["snow"] >= 0.5 or (ps1 or 0) >= 0.2:
+        t = f"Neuschnee im Hauptlauf {n(s['snow'])} cm (fester Faktor 0,7 cm pro mm Wasserwert)"
+        if s["snow"] >= 0.5 and s.get("t_snow") is not None:
+            t += (f"; mit temperaturabhängiger Neuschneedichte nach Anderson (1976) bei {deg(s['t_snow'])} "
+                  f"eher {n(s['hn_dens'])} cm")
+        t += "."
+        if es and es.get("snow"):
+            t += (f" {e[0]}: {pct(es['psnow1'])} für ≥ 1 cm, {pct(es['psnow5'])} für ≥ 5 cm, "
+                  f"{pct(es['psnow10'])} für ≥ 10 cm, 90-%-Quantil {n(es['snow']['p90'])} cm.")
+        out.append(t)
+    else:
+        out.append("Kein Neuschnee.")
+    sd07, sde = s.get("sd07"), s.get("sd_end")
+    if (sd07 or 0) < 0.5 and (sde or 0) < 0.5:
+        out.append("Keine Schneedecke im Modell.")
+    else:
+        t = f"Modellschneehöhe am Morgen {n(sd07)} cm, am Abend {n(sde)} cm"
+        if es and es.get("sd"):
+            t += f" ({e[0]} am Abend 10–90 %: {n(es['sd']['p10'])} bis {n(es['sd']['p90'])} cm)"
+        out.append(t + ".")
+    return "**Schnee:** " + " ".join(out)
 
 
 def wind_phrase(g, d):
@@ -1047,7 +1184,7 @@ def build_report(X):
         e = best_ens(X, "riederalp", d)
         es = e[1] if e else None
         sky = sky_word(s)
-        ps = prec_sentence(s, es)
+        ps = prec_sentence(s, es, sfh=False, snow=False)
         parts = [f"{cap(sky)}{' und trocken' if not ps else ''}.", ps]
         tsent = f"Tiefstwert {deg(s['tmin'])}, Höchstwert {deg(s['tmax'])}"
         if es:
@@ -1058,6 +1195,8 @@ def build_report(X):
             parts.append(cap(wp) + ".")
         parts.append(fzl_sentence(s))
         A(" ".join(p for p in parts if p))
+        A("")
+        A(snow_text(s, e, LOCAL["riederalp"]["elev"], "Riederalp"))
         A("")
         parts = [inv_text(X["inv"].get(d, {}), s, LD["moerel"].get(d))]
         j = LD["jungfraujoch"].get(d)
@@ -1085,8 +1224,8 @@ def build_report(X):
     if len(days) > 2:
         A("### Folgetage")
         A("")
-        A("| Tag | Wetter | Temperatur | Niederschlag | Nullgradgrenze | Sicherheit |")
-        A("|---|---|---|---|---|---|")
+        A("| Tag | Wetter | Temperatur | Niederschlag | Neuschnee | Schneefall- / Nullgradgrenze | Sicherheit |")
+        A("|---|---|---|---|---|---|---|")
         for d in days[2:]:
             s = LD["riederalp"].get(d)
             if not s:
@@ -1101,13 +1240,21 @@ def build_report(X):
             if es and es.get("p1") is not None:
                 pr += f", {pct(es['p1'])}"
             cf = X["conf"].get(d, {}).get("label", "–")
-            A(f"| {dshort(d)} | {wx} | {tt} | {pr} | {hm(s['fzl_mean'])} | {cf} |")
+            hn = f"{n(s['snow'])} cm" + (f", {pct(es['psnow5'])}" if es and es.get("psnow5") is not None else "")
+            sfg = hm(s["sfh_med"]) if (s["prec"] >= 0.3 and s.get("sfh_med") is not None) else "–"
+            A(f"| {dshort(d)} | {wx} | {tt} | {pr} | {hn} | {sfg} / {hm(s['fzl_mean'])} | {cf} |")
         A("")
         A("Temperatur: Tiefst- / Höchstwert im Hauptlauf, in Klammern 10–90 % des Ensembles für den Höchstwert. "
-          "Niederschlag: Tagessumme im Hauptlauf und Wahrscheinlichkeit für mindestens 1 mm.")
+          "Niederschlag: Tagessumme im Hauptlauf und Wahrscheinlichkeit für mindestens 1 mm. "
+          "Neuschnee: Hauptlauf und Wahrscheinlichkeit für mindestens 5 cm. "
+          "Grenzen: Schneefallgrenze bei Niederschlag und mittlere Nullgradgrenze.")
         A("")
         A(trend_text(X))
         A("")
+        A(snow_trend_text(X))
+        A("")
+    A("<!--CHART:schnee-->")
+    A("")
     A("<!--CHART:fan-->")
     A("")
 
@@ -1125,6 +1272,7 @@ def build_report(X):
         for d in days[2:]:
             A(f"- **{dshort(d)}** {wallis_short(X, d)}")
         A("")
+    out.extend(snow_table(X))
 
     # ---------- Schweiz
     A("## Schweiz")
@@ -1218,6 +1366,55 @@ def trend_text(X):
     return " ".join(parts)
 
 
+def snow_trend_text(X):
+    days, LD = X["days"], X["local"]
+    rows = [(d, LD["riederalp"].get(d)) for d in days if LD["riederalp"].get(d)]
+    if not rows:
+        return ""
+    tot = sum(r["snow"] for _, r in rows)
+    parts = []
+    if tot >= 0.5:
+        t = f"Neuschnee auf der Riederalp bis {dshort(days[-1])} im Hauptlauf insgesamt {n(tot)} cm"
+        for lab in ("ECMWF ENS", "NOAA GEFS"):
+            sp = X["snow_period"].get(lab)
+            if sp:
+                t += f", im {lab} Median {n(sp['p50'])} cm (10–90 %: {n(sp['p10'])} bis {n(sp['p90'])} cm)"
+                break
+        parts.append(t + ".")
+    else:
+        parts.append(f"Bis {dshort(days[-1])} im Hauptlauf kein Neuschnee auf der Riederalp.")
+    a, b = rows[0][1].get("sd07"), rows[-1][1].get("sd_end")
+    if (a or 0) >= 0.5 or (b or 0) >= 0.5:
+        parts.append(f"Modellschneehöhe von {n(a)} cm heute früh auf {n(b)} cm am {dshort(rows[-1][0])} abends.")
+    wet = [(d, r["sfh_med"]) for d, r in rows if r["prec"] >= 0.3 and r.get("sfh_med") is not None]
+    if len(wet) >= 2:
+        lo, hi = min(wet, key=lambda x: x[1]), max(wet, key=lambda x: x[1])
+        if hi[1] - lo[1] >= 300:
+            parts.append(f"Die Schneefallgrenze bei Niederschlag bewegt sich zwischen {hm(lo[1])} "
+                         f"({dshort(lo[0])}) und {hm(hi[1])} ({dshort(hi[0])}).")
+    return " ".join(parts)
+
+
+def snow_table(X):
+    days, LD = X["days"], X["local"]
+    out = ["### Schnee im Wallis", "",
+           f"| Ort | Höhe | Schneehöhe heute 07 Uhr | Neuschnee heute und morgen | Neuschnee bis {dshort(days[-1])} "
+           f"| Schneehöhe {dshort(days[-1])} abends |",
+           "|---|---|---|---|---|---|"]
+    for k in SNOW_TABLE:
+        rows = [LD[k].get(d) for d in days]
+        if not rows[0]:
+            continue
+        two = sum(r["snow"] for r in rows[:2] if r)
+        tot = sum(r["snow"] for r in rows if r)
+        last = next((r for r in reversed(rows) if r), None)
+        out.append(f"| {LOCAL[k]['name']} | {LOCAL[k]['elev']} m | {n(rows[0].get('sd07'))} cm | {n(two)} cm | "
+                   f"{n(tot)} cm | {n(last.get('sd_end') if last else None)} cm |")
+    out += ["", "Neuschnee aus dem Hauptlauf mit festem Faktor 0,7 cm pro mm. Schneehöhen sind Gitterpunktwerte "
+            "des Modells; Messungen des SLF können besonders zu Saisonbeginn und in steilem Gelände stark abweichen.", ""]
+    return out
+
+
 def wallis_text(X, d):
     LD = X["local"]
     g = lambda k: LD[k].get(d)
@@ -1238,10 +1435,20 @@ def wallis_text(X, d):
     if simp:
         if simp["prec"] >= 1:
             es = best_ens(X, "simplon", d)
-            parts.append(prec_sentence(simp, es[1] if es else None, place="am Simplon"))
+            parts.append(prec_sentence(simp, es[1] if es else None, place="am Simplon", sfh=False))
         if sion and simp["prec"] >= 5 and simp["prec"] >= 3 * (sion["prec"] + 0.3):
             parts.append(f"Südstaumuster: Simplon {n(simp['prec'], 1)} mm gegenüber {n(sion['prec'], 1)} mm "
                          "in Sion, die inneralpine Lage des Mittelwallis schirmt deutlich ab.")
+    sg = [(nm, st["sfh_med"]) for st, nm in ((simp, "am Simplon"), (zer, "in Zermatt"), (grim, "am Grimsel"))
+          if st and st["prec"] >= 0.3 and st.get("sfh_med") is not None]
+    if sg:
+        parts.append("Schneefallgrenze " + join_de([f"{nm} um {hm(h)}" for nm, h in sg]) + ".")
+    if simp:
+        gap = melt_cooling(simp)
+        if gap:
+            parts.append(f"Am Simplon liegt die Schneefallgrenze {hm(gap)} unter der Nullgradgrenze: "
+                         "Hinweis auf Schmelzkühlung im Stauniederschlag, die Schneefallgrenze kann tiefer sinken als "
+                         "die Faustregel erwarten lässt.")
     fo = X["foehn"].get(d)
     parts.append("\n\n")
     if grim and grim["prec"] >= 5 and fo and fo["min"] <= -3:
@@ -1264,7 +1471,12 @@ def wallis_short(X, d):
     if sion:
         bits.append(f"Sion {sky_word(sion)}, {deg(sion['tmax'])}")
     if simp:
-        bits.append(f"Simplon {n(simp['prec'], 1)} mm")
+        b = f"Simplon {n(simp['prec'], 1)} mm"
+        if simp["snow"] >= 1:
+            b += f", {n(simp['snow'])} cm Neuschnee"
+        if simp["prec"] >= 0.3 and simp.get("sfh_med") is not None:
+            b += f", Schneefallgrenze {hm(simp['sfh_med'])}"
+        bits.append(b)
     fo = X["foehn"].get(d)
     if fo:
         if fo["max"] >= 4:
@@ -1333,11 +1545,32 @@ def swiss_text(X, d):
         t = "**Berge:** " + "; ".join(bits) + "."
         if r and r.get("fzl_mean") is not None:
             t += f" Nullgradgrenze über dem Wallis um {hm(r['fzl_mean'])}."
+        sn = sfh_ns(X, d)
+        if sn:
+            t += " " + sn
         e = X["eu"].get(d) if X["eu"] else None
         if e and e.get("w700") and e["w700"][1] is not None:
             t += f" Höhenwind in 700 hPa (rund 3000 m) aus {dname(e['w700'][0])} mit {n(e['w700'][1] * 3.6)} km/h."
         lines.append(t)
     return lines
+
+
+def sfh_ns(X, d, short=False):
+    LD = X["local"]
+
+    def med(keys):
+        v = [LD[k][d]["sfh_med"] for k in keys if LD[k].get(d) and LD[k][d]["prec"] >= 0.3
+             and LD[k][d].get("sfh_med") is not None]
+        return quant(v, .5) if v else None
+
+    nn, ss = med(("zuerich", "bern", "altdorf", "chur", "saentis")), med(("lugano",))
+    if nn is None and ss is None:
+        return ""
+    if short:
+        return "Schneefallgrenze " + ", ".join(x for x in (f"Nord {hm(nn)}" if nn else "",
+                                                           f"Süd {hm(ss)}" if ss else "") if x)
+    bits = [x for x in (f"im Norden um {hm(nn)}" if nn else "", f"im Süden um {hm(ss)}" if ss else "") if x]
+    return f"Schneefallgrenze bei Niederschlag {join_de(bits)}."
 
 
 def swiss_short(X, d):
@@ -1356,6 +1589,9 @@ def swiss_short(X, d):
     hn = X["hochnebel"].get(d)
     if hn and hn["likely"]:
         bits.append("Hochnebel im Mittelland")
+    sn = sfh_ns(X, d, short=True)
+    if sn:
+        bits.append(sn)
     return "; ".join(bits) + "." if bits else "Keine Daten."
 
 
@@ -1435,8 +1671,6 @@ def insights(X):
                 break
         if s and s["prec"] >= 30:
             I.append((9, f"Starkniederschlag {lab} am Simplon: {n(s['prec'])} mm in 24 h (Südstau)."))
-        if r and r["snow"] >= 10:
-            I.append((8, f"Neuschnee {lab} auf der Riederalp: rund {n(r['snow'])} cm."))
     def both(flags):
         """flags: {d: wert oder None} für heute/morgen -> Tageslabel."""
         hit = [d for d in days[:2] if flags.get(d) is not None]
@@ -1484,6 +1718,37 @@ def insights(X):
             I.append((7, f"{dl} aussergewöhnlich {word} für die Jahreszeit: Höchstwert Riederalp "
                          f"{sgn(cl['anom_tmax'])} K gegenüber 1991–2020 ({int(round(cl['rank_tmax'] * 100))}. Perzentil)."))
             break
+    rows = [(d, LD["riederalp"].get(d)) for d in days if LD["riederalp"].get(d)]
+    sdays = [d for d, r in rows if r["snow"] >= 1]
+    if sdays:
+        tot = sum(r["snow"] for _, r in rows)
+        t = f"Neuschnee auf der Riederalp ab {dshort(sdays[0])}, bis {dshort(days[-1])} insgesamt {n(tot)} cm im Hauptlauf"
+        sp = X["snow_period"].get("ECMWF ENS") or X["snow_period"].get("NOAA GEFS")
+        if sp:
+            t += f" (Ensemble 10–90 %: {n(sp['p10'])} bis {n(sp['p90'])} cm)"
+        I.append((8 if tot >= 10 or max(r["snow"] for _, r in rows) >= 10 else 6, t + "."))
+    if rows and (rows[0][1].get("sd07") or 0) < 1:
+        onset = next(((d, r["sd_end"]) for d, r in rows if (r.get("sd_end") or 0) >= 5), None)
+        if onset:
+            I.append((7, f"Eine Schneedecke bildet sich: Modellschneehöhe Riederalp am {dshort(onset[0])} abends "
+                         f"{n(onset[1])} cm."))
+    wet = [(d, r["sfh_med"]) for d, r in rows if r["prec"] >= 0.3 and r.get("sfh_med") is not None]
+    if len(wet) >= 2:
+        lo = min(wet[1:], key=lambda x: x[1])
+        if wet[0][1] - lo[1] >= 800:
+            I.append((6, f"Schneefallgrenze sinkt von {hm(wet[0][1])} ({dshort(wet[0][0])}) auf {hm(lo[1])} "
+                         f"({dshort(lo[0])})."))
+    for d in days[:3]:
+        for k, nm in (("simplon", "Simplon"), ("riederalp", "Riederalp")):
+            st = LD[k].get(d)
+            gap = melt_cooling(st) if st else None
+            if gap:
+                I.append((5, f"{dshort(d)} {nm}: Schneefallgrenze {hm(gap)} unter der Nullgradgrenze, "
+                             "Hinweis auf Schmelzkühlung im Niederschlag."))
+                break
+        else:
+            continue
+        break
     blk = [d for d in days if X["eu"].get(d, {}).get("blocked")]
     if blk:
         I.append((6, f"Blockierung (Tibaldi-Molteni) ab {dshort(blk[0])} bei "
@@ -1633,6 +1898,13 @@ def method_section(X):
       "Z500 auf einem 10°-Raster (grob). Blockierung nach Tibaldi & Molteni (1990), 80/60/40° N ohne "
       "Breitenvariation. Strahlstrom: Breite des Windmaximums in 250 hPa, 40–70° N.")
     A("")
+    A("**Schnee:** Neuschnee ist der Schneefall von Open-Meteo: Bei ICON-CH zählt Niederschlag als Schnee, wo "
+      "die modelleigene Schneefallgrenze unter der Stationshöhe liegt, umgerechnet mit festem Faktor 0,7 cm pro mm. "
+      "Als Alternative rechnet der Bericht mit der temperaturabhängigen Neuschneedichte nach Anderson (1976), "
+      "ρ = 50 + 1,7·(T + 15)^1,5 kg/m³ für T > −15 °C, mit der 2-m-Temperatur zur Schneefallstunde; "
+      "Setzung, Wind und Schmelze sind nicht berücksichtigt. Schneefallgrenze: Median der Modellwerte während "
+      "Stunden mit mindestens 0,2 mm Niederschlag. Schneehöhe: Modellzustand am Gitterpunkt, keine Messung.")
+    A("")
     A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
     A("")
@@ -1705,6 +1977,78 @@ def svg_profile(X):
     cap = ("Temperaturprofil heute vom Rhonetal bis zum Jungfraujoch: gestrichelt 07 Uhr, durchgezogen 15 Uhr. "
            "Punktiert zum Vergleich der trockenadiabatische Gradient (−9,8 K/km) und die Standardatmosphäre "
            "(−6,5 K/km) ab Mörel. Waagrecht die Nullgradgrenze des Primärmodells.")
+    return "\n".join(p), cap
+
+
+def svg_snow(X):
+    S = X.get("series")
+    if not S or not valid(S["snowfall_height"] + S["freezing_level_height"]):
+        return None
+    days = X["days"]
+    W, H, L_, R_, T_ = 420, 352, 40, 6, 24
+    panel_b, bar_top, bar_b = 236, 262, 318
+    zlo, zhi = 500, 4000
+    x0 = dt.datetime.combine(days[0], dt.time(0))
+    x1 = dt.datetime.combine(days[-1] + dt.timedelta(1), dt.time(0))
+    span = (x1 - x0).total_seconds()
+    X_ = lambda tt: L_ + (tt - x0).total_seconds() / span * (W - L_ - R_)
+    Y_ = lambda z: T_ + (zhi - max(zlo, min(zhi, z))) / (zhi - zlo) * (panel_b - T_)
+    bw = (W - L_ - R_) / len(days)
+    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Schneefallgrenze und Neuschnee Riederalp">']
+    for z in range(1000, 4000, 500):
+        p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{Y_(z):.1f}" y2="{Y_(z):.1f}" class="grid"/>'
+                 f'<text x="{L_ - 4}" y="{Y_(z) + 4:.1f}" class="ax" text-anchor="end">{z}</text>')
+    for d in days:
+        xa = X_(dt.datetime.combine(d, dt.time(0)))
+        p.append(f'<line x1="{xa:.1f}" x2="{xa:.1f}" y1="{T_ - 6}" y2="{bar_b}" class="grid"/>'
+                 f'<text x="{xa + bw / 2:.1f}" y="{T_ - 10}" class="ax" text-anchor="middle">{WDS[d.weekday()]} {d.day}.</text>')
+    if X.get("ens_sfh"):
+        _lab, et, eq = X["ens_sfh"]
+        good = [i for i in range(len(et)) if eq[10][i] is not None and eq[90][i] is not None and x0 <= et[i] <= x1]
+        if len(good) > 2:
+            top = " ".join(f"{X_(et[i]):.1f},{Y_(eq[90][i]):.1f}" for i in good)
+            bot = " ".join(f"{X_(et[i]):.1f},{Y_(eq[10][i]):.1f}" for i in reversed(good))
+            p.append(f'<polygon points="{top} {bot}" class="b1"/>')
+    for k in ("moerel", "riederalp", "moosfluh"):
+        z = LOCAL[k]["elev"]
+        cls = "elev1" if k == "riederalp" else "elev"
+        p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{Y_(z):.1f}" y2="{Y_(z):.1f}" class="{cls}"/>'
+                 f'<text x="{W - R_ - 3}" y="{Y_(z) - 4:.1f}" class="ax" text-anchor="end">{LOCAL[k]["name"]}</text>')
+    t = S["t"]
+    xs = [X_(tt) for tt in t]
+    inside = [x0 <= tt <= x1 for tt in t]
+    fz = [v if ok else None for v, ok in zip(S["freezing_level_height"], inside)]
+    for seg in _segments(xs, fz):
+        p.append(f'<polyline points="{" ".join(f"{x:.1f},{Y_(y):.1f}" for x, y in seg)}" class="fzl"/>')
+    sf = [v if ok else None for v, ok in zip(S["snowfall_height"], inside)]
+    for seg in _segments(xs, sf):
+        p.append(f'<polyline points="{" ".join(f"{x:.1f},{Y_(y):.1f}" for x, y in seg)}" class="sfh"/>')
+    wet = [v if (ok and pr is not None and pr >= 0.2) else None
+           for v, ok, pr in zip(S["snowfall_height"], inside, S["precipitation"])]
+    for seg in _segments(xs, wet):
+        if len(seg) == 1:
+            p.append(f'<circle cx="{seg[0][0]:.1f}" cy="{Y_(seg[0][1]):.1f}" r="2.5" class="sfhwd"/>')
+        else:
+            p.append(f'<polyline points="{" ".join(f"{x:.1f},{Y_(y):.1f}" for x, y in seg)}" class="sfhw"/>')
+    p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{bar_b}" y2="{bar_b}" class="axl"/>')
+    LD = X["local"]["riederalp"]
+    hmax = max([LD[d]["snow"] for d in days if LD.get(d)] + [5])
+    for d in days:
+        st = LD.get(d)
+        if not st:
+            continue
+        xa = X_(dt.datetime.combine(d, dt.time(0)))
+        h = st["snow"] / hmax * (bar_b - bar_top - 14)
+        if h > 0.5:
+            p.append(f'<rect x="{xa + bw * 0.22:.1f}" y="{bar_b - h:.1f}" width="{bw * 0.56:.1f}" height="{h:.1f}" class="snowbar"/>')
+        p.append(f'<text x="{xa + bw / 2:.1f}" y="{bar_b - h - 4:.1f}" class="ax" text-anchor="middle">{n(st["snow"])}</text>')
+        if st.get("sd_end") is not None:
+            p.append(f'<text x="{xa + bw / 2:.1f}" y="{bar_b + 16:.1f}" class="stv" text-anchor="middle">{n(st["sd_end"])}</text>')
+    p.append("</svg>")
+    ens = f", hellblaues Band {X['ens_sfh'][0]} 10–90 %" if X.get("ens_sfh") else ""
+    cap = ("Schneefallgrenze über der Riederalp (blau, kräftig während Niederschlag" + ens +
+           ") und Nullgradgrenze (braun gestrichelt), Höhen in m. Säulen: Neuschnee pro Tag im Hauptlauf in cm; "
+           "Zahlen darunter: Modellschneehöhe am Abend in cm.")
     return "\n".join(p), cap
 
 
@@ -1898,7 +2242,7 @@ svg .ax{fill:var(--muted);font-size:13px}
 svg .ref{stroke:var(--muted);stroke-width:1;stroke-dasharray:1 4;opacity:.8}
 figcaption{font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;font-size:.92rem;line-height:1.4;
 color:var(--muted);padding:.5rem .5rem .2rem}
-svg .fzl{stroke:var(--contour);stroke-width:1.5;stroke-dasharray:6 4}
+svg .fzl{fill:none;stroke:var(--contour);stroke-width:1.5;stroke-dasharray:6 4}
 svg .fzlt{fill:var(--contour);font-size:13px}
 svg .m07{fill:none;stroke:var(--ice);stroke-width:2;stroke-dasharray:5 3}
 svg .m15{fill:none;stroke:var(--warm);stroke-width:2.4}
@@ -1910,6 +2254,12 @@ svg .med{fill:none;stroke:var(--ice);stroke-width:1.6}
 svg .det0{fill:none;stroke:var(--warm);stroke-width:1.4}
 svg .det1{fill:none;stroke:var(--contour);stroke-width:1.2;stroke-dasharray:4 3}
 svg .bar{fill:var(--rain);opacity:.75}
+svg .snowbar{fill:var(--ice);opacity:.55}
+svg .sfh{fill:none;stroke:var(--ice);stroke-width:1;opacity:.55}
+svg .sfhw{fill:none;stroke:var(--ice);stroke-width:2.8}
+svg .sfhwd{fill:var(--ice)}
+svg .elev{stroke:var(--muted);stroke-width:1;stroke-dasharray:1 3}
+svg .elev1{stroke:var(--ink);stroke-width:1.2;stroke-dasharray:3 3}
 .tw{overflow-x:auto;margin:.8rem 0 1.2rem;-webkit-overflow-scrolling:touch}
 table{border-collapse:collapse;font-size:.95rem;min-width:100%}
 th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid var(--rule);vertical-align:top;white-space:nowrap}
@@ -2013,7 +2363,7 @@ def main():
         block = ("## Synoptische Einordnung\n\n" + narr.strip() +
                  "\n\nFormuliert von Claude auf Grundlage der Diagnosen in diesem Bericht; Zahlen in den Tabellen sind massgeblich.\n")
         md = md.replace("<!--NARRATIV-->", block)
-    charts = {"profil": svg_profile(X), "fan": svg_fan(X)}
+    charts = {"profil": svg_profile(X), "fan": svg_fan(X), "schnee": svg_snow(X)}
     os.makedirs(args.out, exist_ok=True)
     md_clean = re.sub(r"<!--[^>]*-->\n?", "", md)
     with open(os.path.join(args.out, "bericht.md"), "w", encoding="utf-8") as f:
