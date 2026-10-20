@@ -2,6 +2,10 @@
 
 Erzeugt einen Wetterbericht im Stil von MeteoSchweiz für Riederalp, Wallis, Schweiz und Europa, für heute, morgen und die Folgetage. Grundlage sind Open-Meteo-Daten: MeteoSchweiz ICON-CH1/CH2 als Primärmodell, ein Multimodellvergleich, fünf Ensembles, ECMWF-Druckflächen über Europa, ERA5-Land 1991–2020 als Klimatologie und CAMS-Aerosol.
 
+Ein eigener Schneeteil enthält für jeden Tag die Schneefallgrenze während des Niederschlags (mit Ensemble-Spanne), den Neuschnee nach festem Faktor und nach temperaturabhängiger Dichte (Anderson 1976) samt Wahrscheinlichkeiten für 1, 5 und 10 cm sowie die Modellschneehöhe. Dazu kommen eine Schneetabelle für sechs Walliser Orte von Mörel bis Moosfluh, die Schneefallgrenze Nord/Süd für die Schweiz und eine Grafik der Schneefallgrenze relativ zur Riederalp.
+
+Vier Karten mit Tagesauswahl: eine Bodendruckkarte Europas (Isobaren, Hoch und Tief, 850-hPa-Temperatur), eine Schweizkarte mit dem Niederschlag pro Tag aus ICON-CH und den Höchstwerten, sowie Wallis- und Riederalp-Karten auf Relief, die das Gelände oberhalb der Schneefallgrenze und die Nullgradgrenze als Höhenlinie zeigen. Der erste Lauf lädt dafür einmalig Geodaten von Natural Earth und Reliefkacheln (Terrain Tiles, AWS Open Data) und speichert sie im Cache.
+
 Neben der klassischen Prognose rechnet das Skript Diagnosen, die in Standardberichten fehlen: Inversion Mörel–Riederalp, Föhnindex Lugano–Zürich, Feuchtefluss gegen den Alpenhauptkamm in 700 hPa, Hochnebelobergrenze, Bise, Trog- und Rückenachsen, geostrophische Höhenströmung, Strahlstromlage, Blockierung nach Tibaldi-Molteni, Saharastaub, Anomalie und Perzentil gegenüber 1991–2020 sowie KI-Ensemble (AIFS) gegen IFS-Ensemble.
 
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.
@@ -32,7 +36,7 @@ Der erste Lauf eines Kalendermonats lädt die ERA5-Land-Klimatologie (30 Abfrage
 
 ## Anpassen
 
-Orte stehen in `LOCAL`, Vergleichsmodelle in `COMPARE`, Ensembles in `ENSEMBLES`. Pro Modell sind mehrere Open-Meteo-IDs hinterlegt, weil Open-Meteo Modelle gelegentlich umbenennt; die erste funktionierende wird verwendet. Schwellen der Diagnosen (Föhn ±4/±8 hPa, Bise +3/+5 hPa, Feuchtefluss 40/80 g kg⁻¹ m s⁻¹) sind Faustregeln und im Code leicht zu ändern.
+Orte stehen in `LOCAL` (die Schneetabelle in `SNOW_TABLE`), Vergleichsmodelle in `COMPARE`, Ensembles in `ENSEMBLES`. Pro Modell sind mehrere Open-Meteo-IDs hinterlegt, weil Open-Meteo Modelle gelegentlich umbenennt; die erste funktionierende wird verwendet. Schwellen der Diagnosen (Föhn ±4/±8 hPa, Bise +3/+5 hPa, Feuchtefluss 40/80 g kg⁻¹ m s⁻¹) sind Faustregeln und im Code leicht zu ändern.
 
 ## Grenzen
 

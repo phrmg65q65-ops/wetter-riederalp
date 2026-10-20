@@ -30,6 +30,7 @@ Daten: Open-Meteo.com, CC BY 4.0 (nicht-kommerzielle Nutzung).
 from __future__ import annotations
 
 import argparse
+import base64
 import calendar
 import datetime as dt
 import html
@@ -37,14 +38,16 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.1"
+VERSION = "1.2"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -86,6 +89,13 @@ LOCAL = {
     "chur": _p("Chur", 46.8508, 9.5320, 593),
     "altdorf": _p("Altdorf", 46.8803, 8.6440, 449),
     "saentis": _p("Säntis", 47.2493, 9.3434, 2502),
+    # zusätzliche Orte für die Schweizkarte
+    "luzern": _p("Luzern", 47.0502, 8.3093, 436),
+    "stgallen": _p("St. Gallen", 47.4245, 9.3767, 670),
+    "neuchatel": _p("Neuchâtel", 46.9900, 6.9293, 430),
+    "locarno": _p("Locarno", 46.1670, 8.7943, 200),
+    "davos": _p("Davos", 46.8027, 9.8360, 1560),
+    "samedan": _p("Samedan", 46.5340, 9.8721, 1709),
 }
 PROFILE = ["moerel", "riederalp", "moosfluh", "jungfraujoch"]
 ENS_LOCS = ["riederalp", "bern", "simplon", "sion"]
@@ -113,6 +123,20 @@ UPPER["bern_ua"] = _p("Bern", 46.95, 7.45)
 
 def region(la, lo):
     return REGION.get((la, lo), f"{la}° N {lo}° E")
+
+
+MAPS = {
+    "europa": {"bbox": (32.0, 71.0, -24.0, 39.0), "W": 420},
+    "schweiz": {"bbox": (45.75, 47.85, 5.85, 10.55), "W": 420, "z": 8, "vex": 3.0},
+    "wallis": {"bbox": (45.85, 46.65, 6.75, 8.45), "W": 420, "z": 9, "vex": 2.0},
+    "riederalp": {"bbox": (46.34, 46.56, 7.90, 8.18), "W": 420, "z": 11, "vex": 1.3},
+}
+EU_LATS = [32 + 3 * i for i in range(14)]
+EU_LONS = [-24 + 3 * i for i in range(22)]
+CH_LATS = [round(45.8 + 0.2 * i, 2) for i in range(11)]
+CH_LONS = [round(5.9 + 0.2 * i, 2) for i in range(24)]
+EU_GRID = {f"e{la}_{lo}": _p("", la, lo) for la in EU_LATS for lo in EU_LONS}
+CH_GRID = {f"s{la}_{lo}": _p("", la, lo) for la in CH_LATS for lo in CH_LONS}
 
 
 REGION = {
@@ -150,7 +174,9 @@ HOURLY_LOCAL = ["temperature_2m", "relative_humidity_2m", "precipitation", "snow
                 "snowfall_height", "sunshine_duration", "cape", "snow_depth"]
 ENS_VARS = ["temperature_2m", "precipitation", "snowfall", "cloud_cover_low", "snowfall_height", "snow_depth"]
 SNOW_TABLE = ["moerel", "simplon", "zermatt", "riederalp", "grimsel", "moosfluh"]  # nach Höhe
-PAUSE_ENS = 8  # Ensemble-Aufrufe sind teuer (Member × Variablen); Minutenlimit schonen
+UPPER_MODELS = ["ecmwf_ifs025", "gfs_global", "icon_global"]  # Druckflächen; Ersatzmodelle bei Ausfall
+MODEL_NAMES = {"ecmwf_ifs025": "ECMWF IFS 0,25°", "gfs_global": "NOAA GFS 0,25°", "icon_global": "DWD ICON global",
+               "meteoswiss_icon_seamless": "ICON-CH", "ecmwf_ifs": "ECMWF IFS 9 km"}
 UPPER_VARS = ["pressure_msl", "geopotential_height_500hPa", "temperature_850hPa",
               "wind_speed_250hPa", "temperature_700hPa", "relative_humidity_700hPa",
               "wind_speed_700hPa", "wind_direction_700hPa"]
@@ -229,15 +255,46 @@ def index_days(rec, days):
     rec["tidx"] = {t: i for i, t in enumerate(rec["t"])}
 
 
-def fetch_model(api, label, candidates, params, keys, days):
+_CALLS = []
+
+
+def rate_budget(weight, limit=500):
+    """Hält die geschätzte Open-Meteo-Last unter dem Minutenlimit (600 gewichtete Aufrufe)."""
+    for _ in range(4):
+        now = time.time()
+        _CALLS[:] = [(t, w) for t, w in _CALLS if now - t < 60]
+        if not _CALLS or sum(w for _, w in _CALLS) + weight <= limit:
+            break
+        wait = max(1.0, 61 - (now - _CALLS[0][0]))
+        print(f"  … warte {wait:.0f} s (Open-Meteo-Minutenlimit)", file=sys.stderr)
+        time.sleep(wait)
+    _CALLS.append((time.time(), weight))
+
+
+def parse_daily(data, keys, days=None):
+    items = data if isinstance(data, list) else [data]
+    if len(items) != len(keys):
+        raise ApiError("Antwort enthält nicht alle Orte")
+    out = {}
+    for k, it in zip(keys, items):
+        dd = it.get("daily") or {}
+        out[k] = {"d": [dt.date.fromisoformat(x) for x in dd.get("time", [])],
+                  "v": {kk: vv for kk, vv in dd.items() if kk != "time"}}
+    return out
+
+
+def fetch_model(api, label, candidates, params, keys, days, factor=1.0, parser=None):
     last = None
+    nvars = len((params.get("hourly") or params.get("daily") or "x").split(","))
+    weight = len(keys) * max(1, math.ceil(nvars / 10)) * max(1, math.ceil(params.get("forecast_days", 7) / 14)) * factor
     for mid in candidates:
         p = dict(params)
         p["models"] = mid
         try:
+            rate_budget(weight)
             data = fetch_json(api, p)
             time.sleep(PAUSE)
-            parsed = parse_hourly(data, keys, days)
+            parsed = (parser or parse_hourly)(data, keys, days)
             if not any(valid(arr) for rec in parsed.values() for arr in rec["v"].values()):
                 raise ApiError("nur leere Werte")
             return mid, parsed
@@ -288,11 +345,10 @@ def collect(days, cache_dir):
              "forecast_days": nd}
     for label, cands in ENSEMBLES:
         print(f"Lade Ensemble {label} …", file=sys.stderr)
-        mid, parsed = fetch_model(API_ENS, label, cands, ebase, ENS_LOCS, days)
+        mid, parsed = fetch_model(API_ENS, label, cands, ebase, ENS_LOCS, days, factor=5)
         if parsed:
             D["ens"].append((label, mid, parsed))
             D["runs"][label] = mid
-        time.sleep(PAUSE_ENS)
 
     print("Lade Druckflächen Europa …", file=sys.stderr)
     ukeys = list(UPPER)
@@ -300,10 +356,22 @@ def collect(days, cache_dir):
     ubase = {**coords(ukeys, UPPER, elev=False), "hourly": ",".join(UPPER_VARS),
              "timezone": "GMT", "forecast_days": nd, "wind_speed_unit": "ms",
              "cell_selection": "nearest"}
-    mid, up = fetch_model(API_FC, "ECMWF IFS 0,25° (Druckflächen)", ["ecmwf_ifs025"], ubase, ukeys, udays)
+    mid, up = fetch_model(API_FC, "Druckflächen Europa", UPPER_MODELS, ubase, ukeys, udays)
     D["up"] = up
     if mid:
-        D["runs"]["IFS 0,25° Druckflächen"] = mid
+        D["runs"]["Druckflächen Europa"] = mid
+
+    print("Lade Kartenfeld Europa …", file=sys.stderr)
+    ekeys = list(EU_GRID)
+    egp = {**coords(ekeys, EU_GRID, elev=False), "hourly": "pressure_msl,temperature_850hPa", "timezone": "GMT",
+           "forecast_days": nd, "cell_selection": "nearest"}
+    D["eu_grid_model"], D["eu_grid"] = fetch_model(API_FC, "Europakarte", UPPER_MODELS, egp, ekeys, udays)
+    print("Lade Kartenfeld Schweiz …", file=sys.stderr)
+    skeys = list(CH_GRID)
+    sgp = {**coords(skeys, CH_GRID, elev=False), "daily": "precipitation_sum,snowfall_sum,temperature_2m_max",
+           "timezone": TZNAME, "forecast_days": min(5, nd)}
+    D["ch_grid_model"], D["ch_grid"] = fetch_model(API_FC, "Schweizkarte", ["meteoswiss_icon_seamless", "ecmwf_ifs"],
+                                                   sgp, skeys, days, parser=parse_daily)
 
     print("Lade CAMS-Aerosol …", file=sys.stderr)
     try:
@@ -1221,6 +1289,8 @@ def build_report(X):
             parts.append(night_text(X))
         A(" ".join(p for p in parts if p))
         A("")
+    A("<!--CHART:karte_ried-->")
+    A("")
     if len(days) > 2:
         A("### Folgetage")
         A("")
@@ -1261,6 +1331,8 @@ def build_report(X):
     # ---------- Wallis
     A("## Wallis")
     A("")
+    A("<!--CHART:karte_wallis-->")
+    A("")
     for d in days[:2]:
         A(f"### {'Heute' if d == d0 else 'Morgen'}, {dlong(d)}")
         A("")
@@ -1277,6 +1349,8 @@ def build_report(X):
     # ---------- Schweiz
     A("## Schweiz")
     A("")
+    A("<!--CHART:karte_schweiz-->")
+    A("")
     for d in days[:2]:
         A(f"### {'Heute' if d == d0 else 'Morgen'}, {dlong(d)}")
         A("")
@@ -1292,6 +1366,8 @@ def build_report(X):
 
     # ---------- Europa
     A("## Europa")
+    A("")
+    A("<!--CHART:karte_europa-->")
     A("")
     if X["eu"]:
         A("### Allgemeine Lage")
@@ -1575,7 +1651,7 @@ def sfh_ns(X, d, short=False):
 
 def swiss_short(X, d):
     LD = X["local"]
-    zh, lu, ge = LD["zuerich"].get(d), LD["lugano"].get(d), LD["genf"].get(d)
+    zh, lu = LD["zuerich"].get(d), LD["lugano"].get(d)
     bits = []
     if zh:
         bits.append(f"Norden {sky_word(zh, lowland=True)}, Zürich {deg(zh['tmax'])}"
@@ -1905,6 +1981,13 @@ def method_section(X):
       "Setzung, Wind und Schmelze sind nicht berücksichtigt. Schneefallgrenze: Median der Modellwerte während "
       "Stunden mit mindestens 0,2 mm Niederschlag. Schneehöhe: Modellzustand am Gitterpunkt, keine Messung.")
     A("")
+    A("**Karten:** Bodendruckkarte und 850-hPa-Temperatur aus ECMWF IFS 0,25° (Ersatz: GFS, ICON global) auf "
+      "einem 3°-Raster (12 UTC), "
+      "Isobaren per Marching Squares und Glättung; Hoch und Tief als lokale Extrema des Rasters. Niederschlag Schweiz "
+      "aus ICON-CH auf einem 0,2°-Raster, bilinear interpoliert. Wallis und Riederalp: Relief aus Terrain Tiles "
+      "(Mapzen, AWS Open Data; Ersatz: Open-Meteo-Höhenmodell), Schneefallgrenze und Nullgradgrenze als Höhenlinien "
+      "des Reliefs. Gewässer und Grenzen: Natural Earth.")
+    A("")
     A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
     A("")
@@ -2129,6 +2212,801 @@ def svg_fan(X):
     return "\n".join(p), cap
 
 
+# ================================================================ Karten
+NE_BASE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
+NE_LAYERS = [("coast", "ne_50m_coastline", ("europa",)),
+             ("borders", "ne_50m_admin_0_boundary_lines_land", ("europa",)),
+             ("borders", "ne_10m_admin_0_boundary_lines_land", ("schweiz", "wallis", "riederalp")),
+             ("lakes", "ne_10m_lakes", ("schweiz", "wallis", "riederalp")),
+             ("lakes", "ne_10m_lakes_europe", ("schweiz", "wallis", "riederalp")),
+             ("rivers", "ne_10m_rivers_lake_centerlines", ("schweiz", "wallis", "riederalp"))]
+TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+API_ELEV = "https://api.open-meteo.com/v1/elevation"
+
+
+class Proj:
+    """Flächentreue genügt hier nicht; einfache Plattkarte mit cos(φ)-Streckung."""
+
+    def __init__(self, bbox, W):
+        self.la0, self.la1, self.lo0, self.lo1 = bbox
+        self.k = math.cos(math.radians((self.la0 + self.la1) / 2))
+        self.s = W / ((self.lo1 - self.lo0) * self.k)
+        self.W, self.H = W, int(round((self.la1 - self.la0) * self.s))
+
+    def xy(self, lat, lon):
+        return (lon - self.lo0) * self.k * self.s, (self.la1 - lat) * self.s
+
+    def ll(self, x, y):
+        return self.la1 - y / self.s, self.lo0 + x / (self.k * self.s)
+
+
+def fetch_bytes(url, timeout=60):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise ApiError(f"{url.split('/')[2]}: {e}")
+
+
+# ---------------------------------------------------------------- PNG
+def png_encode(w, h, rows, ct):
+    """rows: Bytezeilen ohne Filterbyte; ct 4 = Grau+Alpha, 6 = RGBA. Filter 'Up'."""
+    out, prev = bytearray(), bytes(len(rows[0]))
+    for r in rows:
+        out.append(2)
+        out.extend(bytes((a - b) & 255 for a, b in zip(r, prev)))
+        prev = r
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ct, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(out), 9)) + chunk(b"IEND", b""))
+
+
+def png_uri(w, h, rows, ct):
+    return "data:image/png;base64," + base64.b64encode(png_encode(w, h, rows, ct)).decode()
+
+
+def png_decode(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("kein PNG")
+    pos, idat, hdr = 8, [], None
+    while pos < len(data):
+        ln = struct.unpack(">I", data[pos:pos + 4])[0]
+        typ, chunk = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + ln]
+        pos += 12 + ln
+        if typ == b"IHDR":
+            hdr = struct.unpack(">IIBBBBB", chunk)
+        elif typ == b"IDAT":
+            idat.append(chunk)
+        elif typ == b"IEND":
+            break
+    w, h, bd, ct, _c, _f, il = hdr
+    if bd != 8 or ct not in (2, 6) or il != 0:
+        raise ValueError(f"PNG-Format nicht unterstützt (Tiefe {bd}, Typ {ct})")
+    bpp = 3 if ct == 2 else 4
+    raw, stride = zlib.decompress(b"".join(idat)), w * bpp
+    out, prev, i = bytearray(h * stride), bytearray(stride), 0
+    for y in range(h):
+        ft = raw[i]
+        line = bytearray(raw[i + 1:i + 1 + stride])
+        i += 1 + stride
+        if ft == 1:
+            for x in range(bpp, stride):
+                line[x] = (line[x] + line[x - bpp]) & 255
+        elif ft == 2:
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        elif ft == 3:
+            for x in range(stride):
+                left = line[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + ((left + prev[x]) >> 1)) & 255
+        elif ft == 4:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                c = prev[x - bpp] if x >= bpp else 0
+                pp = a + b - c
+                pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                line[x] = (line[x] + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 255
+        out[y * stride:(y + 1) * stride] = line
+        prev = line
+    return w, h, bpp, out
+
+
+# ---------------------------------------------------------------- Geodaten
+def geom_parts(g):
+    t, c = (g or {}).get("type"), (g or {}).get("coordinates") or []
+    if t == "LineString":
+        return [c]
+    if t in ("MultiLineString", "Polygon"):
+        return list(c)
+    if t == "MultiPolygon":
+        return [ring for poly in c for ring in poly]
+    return []
+
+
+def load_geo(cache_dir):
+    path = os.path.join(cache_dir, "geo_naturalearth_v1.json")
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    print("Lade Geodaten (Natural Earth, einmalig) …", file=sys.stderr)
+    geo = {m: {"coast": [], "borders": [], "lakes": [], "rivers": []} for m in MAPS}
+    complete = True
+    for kind, fname, maps in NE_LAYERS:
+        try:
+            data = json.loads(fetch_bytes(NE_BASE + fname + ".geojson", timeout=120))
+        except (ApiError, json.JSONDecodeError) as e:
+            log(f"Natural Earth {fname} ({e})")
+            complete = False
+            continue
+        for m in maps:
+            la0, la1, lo0, lo1 = MAPS[m]["bbox"]
+            pad = 2.0 if m == "europa" else 0.15
+            for f in data.get("features", []):
+                for part in geom_parts(f.get("geometry")):
+                    if part and any(lo0 - pad <= q[0] <= lo1 + pad and la0 - pad <= q[1] <= la1 + pad for q in part):
+                        geo[m][kind].append([[round(q[0], 4), round(q[1], 4)] for q in part])
+    if complete:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(geo, f)
+    return geo
+
+
+def path_d(P, parts, closed=False, tol=0.8, margin=25):
+    """Linien in SVG-Pfade; Linien werden am Rand aufgetrennt, Flächen auf den Rand geklemmt."""
+    out = []
+    for part in parts:
+        run, last = [], None
+        for q in part:
+            x, y = P.xy(q[1], q[0])
+            inside = -margin <= x <= P.W + margin and -margin <= y <= P.H + margin
+            if closed:
+                x, y = min(max(x, -margin), P.W + margin), min(max(y, -margin), P.H + margin)
+            elif not inside:
+                if len(run) > 1:
+                    out.append(run)
+                run, last = [], None
+                continue
+            if last and abs(x - last[0]) < tol and abs(y - last[1]) < tol:
+                continue
+            run.append((x, y))
+            last = (x, y)
+        if len(run) > 1 and (not closed or any(0 <= x <= P.W and 0 <= y <= P.H for x, y in run)):
+            out.append(run)
+    return "".join("M" + "L".join(f"{x:.1f},{y:.1f}" for x, y in r) + ("Z" if closed else "") for r in out)
+
+
+# ---------------------------------------------------------------- Relief
+def tile_frac(lat, lon, z):
+    n2 = 2 ** z
+    return (lon + 180) / 360 * n2, (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n2
+
+
+def dem_from_tiles(P, z):
+    fx0, fy0 = tile_frac(P.la1, P.lo0, z)
+    fx1, fy1 = tile_frac(P.la0, P.lo1, z)
+    tiles = {}
+    for tx in range(int(fx0), int(fx1) + 1):
+        for ty in range(int(fy0), int(fy1) + 1):
+            w, h, bpp, px = png_decode(fetch_bytes(TILE_URL.format(z=z, x=tx, y=ty)))
+            tiles[(tx, ty)] = (w, h, [px[i] * 256 + px[i + 1] + px[i + 2] / 256 - 32768
+                                      for i in range(0, len(px), bpp)])
+    fys = [tile_frac(P.ll(0, j + 0.5)[0], P.lo0, z)[1] for j in range(P.H)]
+    fxs = [tile_frac(P.la0, P.ll(i + 0.5, 0)[1], z)[0] for i in range(P.W)]
+    dem = []
+    for fy in fys:
+        ty = int(fy)
+        row = []
+        for fx in fxs:
+            tx = int(fx)
+            w, h, e = tiles[(tx, ty)]
+            u, v = (fx - tx) * w - 0.5, (fy - ty) * h - 0.5
+            x0, y0 = min(max(int(math.floor(u)), 0), w - 1), min(max(int(math.floor(v)), 0), h - 1)
+            x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+            ax, ay = min(max(u - x0, 0.0), 1.0), min(max(v - y0, 0.0), 1.0)
+            top = e[y0 * w + x0] * (1 - ax) + e[y0 * w + x1] * ax
+            bot = e[y1 * w + x0] * (1 - ax) + e[y1 * w + x1] * ax
+            row.append(round(top * (1 - ay) + bot * ay))
+        dem.append(row)
+    return dem
+
+
+def dem_from_openmeteo(P, nx=56):
+    ny = max(8, round(nx * P.H / P.W))
+    pts = [P.ll((i + 0.5) * P.W / nx, (j + 0.5) * P.H / ny) for j in range(ny) for i in range(nx)]
+    vals = []
+    for c in range(0, len(pts), 100):
+        chunk = pts[c:c + 100]
+        rate_budget(10)
+        j = fetch_json(API_ELEV, {"latitude": ",".join(f"{a:.4f}" for a, _ in chunk),
+                                  "longitude": ",".join(f"{b:.4f}" for _, b in chunk)})
+        vals += j.get("elevation", [])
+        time.sleep(PAUSE)
+    if len(vals) != len(pts):
+        raise ApiError("Höhendaten unvollständig")
+    G = [vals[j * nx:(j + 1) * nx] for j in range(ny)]
+    dem = []
+    for y in range(P.H):
+        fy = min(max((y + 0.5) / P.H * ny - 0.5, 0), ny - 1.001)
+        j0, ay = int(fy), fy - int(fy)
+        row = []
+        for x in range(P.W):
+            fx = min(max((x + 0.5) / P.W * nx - 0.5, 0), nx - 1.001)
+            i0, ax = int(fx), fx - int(fx)
+            t = G[j0][i0] * (1 - ax) + G[j0][i0 + 1] * ax
+            b = G[j0 + 1][i0] * (1 - ax) + G[j0 + 1][i0 + 1] * ax
+            row.append(round(t * (1 - ay) + b * ay))
+        dem.append(row)
+    return dem
+
+
+def load_dem(name, cache_dir):
+    cfg = MAPS[name]
+    P = Proj(cfg["bbox"], cfg["W"])
+    path = os.path.join(cache_dir, f"dem_{name}_v1.json")
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("W") == P.W and d.get("H") == P.H:
+                return d["dem"], d.get("src")
+        except (OSError, json.JSONDecodeError):
+            pass
+    print(f"Lade Relief {name} (einmalig) …", file=sys.stderr)
+    dem, src = None, None
+    try:
+        dem, src = dem_from_tiles(P, cfg["z"]), "Terrain Tiles"
+    except (ApiError, ValueError, zlib.error, KeyError, struct.error) as e:
+        log(f"Relief {name}: Terrain Tiles ({e})")
+    if dem is None:
+        try:
+            dem, src = dem_from_openmeteo(P), "Open-Meteo-Höhenmodell"
+        except ApiError as e:
+            log(f"Relief {name}: Open-Meteo ({e})")
+            return None, None
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"W": P.W, "H": P.H, "src": src, "dem": dem}, f)
+    return dem, src
+
+
+def relief_uri(dem, P, vex):
+    W, H = P.W, P.H
+    dx = (P.lo1 - P.lo0) / W * 111320 * P.k
+    dy = (P.la1 - P.la0) / H * 110574
+    az, alt = math.radians(315), math.radians(45)
+    Lx, Ly, Lz = math.sin(az) * math.cos(alt), math.cos(az) * math.cos(alt), math.sin(alt)
+    rows = []
+    for j in range(H):
+        jm, jp = max(j - 1, 0), min(j + 1, H - 1)
+        r = bytearray(2 * W)
+        for i in range(W):
+            im, ip = max(i - 1, 0), min(i + 1, W - 1)
+            gx = (dem[j][ip] - dem[j][im]) / ((ip - im) * dx) * vex
+            gy = (dem[jm][i] - dem[jp][i]) / ((jp - jm) * dy) * vex
+            dv = (-gx * Lx - gy * Ly + Lz) / math.sqrt(gx * gx + gy * gy + 1) - Lz
+            if dv < 0:
+                r[2 * i], r[2 * i + 1] = 0, min(200, int(-dv * 300))
+            else:
+                r[2 * i], r[2 * i + 1] = 255, min(200, int(dv * 240))
+        rows.append(bytes(r))
+    return png_uri(W, H, rows, 4)
+
+
+TINT_STOPS = [(200, (178, 198, 160)), (900, (192, 204, 165)), (1600, (214, 204, 168)), (2300, (206, 186, 158)),
+              (3000, (178, 168, 160)), (4200, (160, 160, 168))]
+
+
+def tint_uri(dem, P):
+    rows = []
+    for j in range(P.H):
+        r = bytearray(4 * P.W)
+        for i, z in enumerate(dem[j]):
+            if z <= TINT_STOPS[0][0]:
+                c = TINT_STOPS[0][1]
+            elif z >= TINT_STOPS[-1][0]:
+                c = TINT_STOPS[-1][1]
+            else:
+                for (a, ca), (b, cb) in zip(TINT_STOPS, TINT_STOPS[1:]):
+                    if a <= z <= b:
+                        t = (z - a) / (b - a)
+                        c = tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
+                        break
+            r[4 * i:4 * i + 4] = bytes((*c, 150))
+        rows.append(bytes(r))
+    return png_uri(P.W, P.H, rows, 6)
+
+
+def snow_uri(dem, P, level):
+    rows = []
+    for j in range(P.H):
+        r = bytearray(2 * P.W)
+        for i, z in enumerate(dem[j]):
+            a = (z - level) / 80.0 + 0.5
+            if a > 0:
+                r[2 * i], r[2 * i + 1] = 255, int(min(1.0, a) * 215)
+        rows.append(bytes(r))
+    return png_uri(P.W, P.H, rows, 4)
+
+
+# ---------------------------------------------------------------- Isolinien
+def march(Z, level):
+    """Marching Squares auf einem Raster (Zeilen × Spalten); liefert Segmente in Indexkoordinaten (x=Spalte)."""
+    segs = []
+    for j in range(len(Z) - 1):
+        r0, r1 = Z[j], Z[j + 1]
+        for i in range(len(r0) - 1):
+            a, b, c, d = r0[i], r0[i + 1], r1[i + 1], r1[i]
+            if a is None or b is None or c is None or d is None:
+                continue
+            idx = (a > level) | ((b > level) << 1) | ((c > level) << 2) | ((d > level) << 3)
+            if idx == 0 or idx == 15:
+                continue
+            f = lambda p, q: (level - p) / (q - p) if q != p else 0.5
+            T, R = (i + f(a, b), j), (i + 1, j + f(b, c))
+            B, L = (i + f(d, c), j + 1), (i, j + f(a, d))
+            ctr = (a + b + c + d) / 4 > level
+            cases = {1: [(L, T)], 2: [(T, R)], 3: [(L, R)], 4: [(R, B)], 6: [(T, B)], 7: [(L, B)],
+                     8: [(B, L)], 9: [(T, B)], 11: [(R, B)], 12: [(L, R)], 13: [(T, R)], 14: [(L, T)],
+                     5: [(T, R), (B, L)] if ctr else [(L, T), (R, B)],
+                     10: [(L, T), (R, B)] if ctr else [(T, R), (B, L)]}
+            segs.extend(cases[idx])
+    return segs
+
+
+def join_segments(segs):
+    key = lambda q: (round(q[0], 4), round(q[1], 4))
+    ends = {}
+    for k, (a, b) in enumerate(segs):
+        ends.setdefault(key(a), []).append(k)
+        ends.setdefault(key(b), []).append(k)
+    used, lines = [False] * len(segs), []
+    for k in range(len(segs)):
+        if used[k]:
+            continue
+        used[k] = True
+        line = list(segs[k])
+        for _ in range(2):
+            while True:
+                kk = key(line[-1])
+                nxt = next((m for m in ends.get(kk, []) if not used[m]), None)
+                if nxt is None:
+                    break
+                used[nxt] = True
+                a, b = segs[nxt]
+                line.append(b if key(a) == kk else a)
+            line.reverse()
+        lines.append(line)
+    return lines
+
+
+def chaikin(pts, it=2):
+    closed = len(pts) > 3 and abs(pts[0][0] - pts[-1][0]) < 1e-6 and abs(pts[0][1] - pts[-1][1]) < 1e-6
+    for _ in range(it):
+        if len(pts) < 3:
+            break
+        new = [] if closed else [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            new += [(0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]),
+                    (0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1])]
+        if closed:
+            new.append(new[0])
+        else:
+            new.append(pts[-1])
+        pts = new
+    return pts
+
+
+def thin(pts, tol=1.2):
+    """Punkte näher als tol Pixel am zuletzt behaltenen Punkt weglassen (Endpunkt bleibt)."""
+    if len(pts) < 3:
+        return pts
+    out = [pts[0]]
+    for q in pts[1:-1]:
+        if abs(q[0] - out[-1][0]) >= tol or abs(q[1] - out[-1][1]) >= tol:
+            out.append(q)
+    out.append(pts[-1])
+    return out
+
+
+def poly_len(pts):
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+def dem_contour(dem, level, step=2):
+    Z = [row[::step] for row in dem[::step]]
+    lines = [thin([(x * step + 0.5, y * step + 0.5) for x, y in ln], 1.5) for ln in join_segments(march(Z, level))]
+    return "".join("M" + "L".join(f"{x:.1f},{y:.1f}" for x, y in ln) for ln in lines if len(ln) > 3)
+
+
+def grid_interp(G, lats, lons, lat, lon):
+    fi = min(max((lat - lats[0]) / (lats[1] - lats[0]), 0.0), len(lats) - 1.0001)
+    fj = min(max((lon - lons[0]) / (lons[1] - lons[0]), 0.0), len(lons) - 1.0001)
+    i0, j0 = int(fi), int(fj)
+    a, b = fi - i0, fj - j0
+    v = (G[i0][j0], G[i0][j0 + 1], G[i0 + 1][j0], G[i0 + 1][j0 + 1])
+    if None in v:
+        vv = [x for x in v if x is not None]
+        return sum(vv) / len(vv) if vv else None
+    return (v[0] * (1 - b) + v[1] * b) * (1 - a) + (v[2] * (1 - b) + v[3] * b) * a
+
+
+def field_uri(P, G, lats, lons, color, scale=2):
+    w, h = P.W // scale, P.H // scale
+    rows = []
+    for j in range(h):
+        r = bytearray(4 * w)
+        for i in range(w):
+            lat, lon = P.ll((i + 0.5) * scale, (j + 0.5) * scale)
+            c = color(grid_interp(G, lats, lons, lat, lon))
+            if c:
+                r[4 * i:4 * i + 4] = bytes(c)
+        rows.append(bytes(r))
+    return f'<image href="{png_uri(w, h, rows, 6)}" x="0" y="0" width="{P.W}" height="{P.H}" preserveAspectRatio="none"/>'
+
+
+def grid_isolines(P, G, lats, lons, levels, up=3, label=True, cls="isob", avoid=()):
+    nla, nlo = (len(lats) - 1) * up + 1, (len(lons) - 1) * up + 1
+    dla, dlo = (lats[1] - lats[0]) / up, (lons[1] - lons[0]) / up
+    F = [[grid_interp(G, lats, lons, lats[0] + j * dla, lons[0] + i * dlo) for i in range(nlo)] for j in range(nla)]
+    paths, labels = [], []
+    for lev in levels:
+        for ln in join_segments(march(F, lev)):
+            pts = thin(chaikin([P.xy(lats[0] + y * dla, lons[0] + x * dlo) for x, y in ln], 2), 1.5)
+            if len(pts) < 3:
+                continue
+            paths.append("M" + "L".join(f"{x:.1f},{y:.1f}" for x, y in pts))
+            L = poly_len(pts)
+            if label and L > 90:
+                for frac_ in ((0.5,) if L < 320 else (0.3, 0.7)):
+                    x, y = pts[int(len(pts) * frac_)]
+                    if 12 < x < P.W - 12 and 10 < y < P.H - 6 and all(math.hypot(x - ax, y - ay) > 24 for ax, ay in avoid):
+                        labels.append(f'<text x="{x:.0f}" y="{y + 3.5:.0f}" class="ilbl" text-anchor="middle">{lev}</text>')
+    return f'<path d="{"".join(paths)}" class="{cls}"/>' + "".join(labels)
+
+
+def grid_extrema(P, G, lats, lons, pos=None):
+    out = []
+    for i in range(1, len(lats) - 1):
+        for j in range(1, len(lons) - 1):
+            v = G[i][j]
+            nb = [G[i + a][j + b] for a in (-1, 0, 1) for b in (-1, 0, 1) if (a or b)]
+            if v is None or None in nb:
+                continue
+            m = sum(nb) / len(nb)
+            if v < min(nb) and m - v >= 0.8:
+                kind = "T"
+            elif v > max(nb) and v - m >= 0.8:
+                kind = "H"
+            else:
+                continue
+            x, y = P.xy(lats[i], lons[j])
+            if pos is not None:
+                pos.append((x, y))
+            out.append(f'<text x="{x:.0f}" y="{y:.0f}" class="ext ext{kind}" text-anchor="middle">{kind}</text>'
+                       f'<text x="{x:.0f}" y="{y + 12:.0f}" class="extv" text-anchor="middle">{n(v)}</text>')
+    return "".join(out)
+
+
+def band_color(v, stops, step, alpha):
+    if v is None:
+        return None
+    v = math.floor(v / step) * step + step / 2
+    if v <= stops[0][0]:
+        c = stops[0][1]
+    elif v >= stops[-1][0]:
+        c = stops[-1][1]
+    else:
+        for (a, ca), (b, cb) in zip(stops, stops[1:]):
+            if a <= v <= b:
+                t = (v - a) / (b - a)
+                c = tuple(round(x + (y - x) * t) for x, y in zip(ca, cb))
+                break
+    return (*c, alpha)
+
+
+T850_STOPS = [(-24, (59, 42, 122)), (-16, (44, 95, 168)), (-8, (79, 155, 209)), (-2, (169, 211, 232)),
+              (2, (240, 232, 190)), (8, (242, 181, 107)), (14, (226, 112, 63)), (20, (184, 50, 42)),
+              (26, (122, 21, 40))]
+PREC_BANDS = [(0.5, (205, 228, 242)), (2, (150, 196, 232)), (5, (86, 150, 210)), (10, (44, 104, 184)),
+              (20, (104, 72, 178)), (40, (165, 62, 160)), (80, (212, 60, 112))]
+
+
+def prec_color(v):
+    if v is None or v < PREC_BANDS[0][0]:
+        return None
+    c = [col for thr, col in PREC_BANDS if v >= thr][-1]
+    return (*c, 205)
+
+
+# ---------------------------------------------------------------- Bausteine
+def svg_open(P, cls=""):
+    return f'<svg viewBox="0 0 {P.W} {P.H}" class="maplayer {cls}" aria-hidden="true">'
+
+
+def scale_bar(P):
+    px_km = P.s / 111.32
+    km = next(k for k in (1, 2, 5, 10, 20, 50, 100, 200) if k * px_km >= 60)
+    L, x, y = km * px_km, 12, P.H - 14
+    return (f'<rect x="{x - 4}" y="{y - 14}" width="{L + 8}" height="22" rx="3" class="box"/>'
+            f'<line x1="{x}" x2="{x + L:.1f}" y1="{y}" y2="{y}" class="sbar"/>'
+            f'<text x="{x + L / 2:.1f}" y="{y - 4}" class="ax" text-anchor="middle">{km} km</text>')
+
+
+def base_layer(P, geo, name, dem, vex):
+    h = [svg_open(P, "base")]
+    if dem:
+        h.append(f'<image href="{tint_uri(dem, P)}" x="0" y="0" width="{P.W}" height="{P.H}" '
+                 'preserveAspectRatio="none" class="tint"/>')
+        h.append(f'<image href="{relief_uri(dem, P, vex)}" x="0" y="0" width="{P.W}" height="{P.H}" '
+                 'preserveAspectRatio="none" class="relief"/>')
+    g = geo.get(name, {}) if geo else {}
+    if g.get("lakes"):
+        h.append(f'<path d="{path_d(P, g["lakes"], closed=True, tol=0.6)}" class="lake"/>')
+    if g.get("rivers"):
+        h.append(f'<path d="{path_d(P, g["rivers"], tol=0.8)}" class="river"/>')
+    if g.get("borders"):
+        h.append(f'<path d="{path_d(P, g["borders"], tol=0.6)}" class="border"/>')
+    h.append(scale_bar(P))
+    h.append("</svg>")
+    return "".join(h)
+
+
+def station(P, k, top, sub=None, anchor="c", strong=False):
+    L = LOCAL[k]
+    x, y = P.xy(L["lat"], L["lon"])
+    dot = (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{4 if strong else 2.6}" class="{"sdot2" if strong else "sdot"}"/>')
+    if anchor == "c":
+        t = (f'<text x="{x:.1f}" y="{y - 6:.1f}" class="lbl lt" text-anchor="middle">{top}</text>'
+             + (f'<text x="{x:.1f}" y="{y + 13:.1f}" class="lbl ls" text-anchor="middle">{sub}</text>' if sub else ""))
+    else:
+        ta, dx = ("start", 6) if anchor == "e" else ("end", -6)
+        t = (f'<text x="{x + dx:.1f}" y="{y + 1:.1f}" class="lbl lt" text-anchor="{ta}">{top}</text>'
+             + (f'<text x="{x + dx:.1f}" y="{y + 12:.1f}" class="lbl ls" text-anchor="{ta}">{sub}</text>' if sub else ""))
+    return dot + t
+
+
+def info_box(lines, P=None, corner="tl"):
+    h = 8 + 15 * len(lines)
+    w = 12 + 6.4 * max(len(t) for t in lines)
+    x = 8 if corner == "tl" or P is None else P.W - w - 8
+    return (f'<rect x="{x:.0f}" y="8" width="{w:.0f}" height="{h}" rx="3" class="box"/>'
+            + "".join(f'<text x="{x + 6:.0f}" y="{24 + 15 * k}" class="ax">{html.escape(t)}</text>'
+                      for k, t in enumerate(lines)))
+
+
+def map_widget(group, P, panes, base=None, top=None, legend=""):
+    h = ['<div class="mapw">']
+    for i, (lab, _) in enumerate(panes):
+        h.append(f'<input type="radio" name="{group}" id="{group}{i}"{" checked" if i == 0 else ""}>'
+                 f'<label for="{group}{i}">{html.escape(lab)}</label>')
+    h.append(f'<div class="stack" style="aspect-ratio:{P.W}/{P.H}">')
+    if base:
+        h.append(base)
+    h.append('<div class="panes">' + "".join(f"<div>{svg}</div>" for _, svg in panes) + "</div>")
+    if top:
+        h.append(top)
+    h.append("</div>" + legend + "</div>")
+    return "".join(h)
+
+
+def legend_html(items):
+    return ('<div class="mlegend">' + "".join(
+        f'<span>{f"<i style={chr(34)}{style}{chr(34)}></i>" if style else ""}{html.escape(txt)}</span>'
+        for style, txt in items) + "</div>")
+
+
+def tab_label(d, days):
+    return "Heute" if d == days[0] else ("Morgen" if len(days) > 1 and d == days[1] else f"{WDS[d.weekday()]} {d.day}.")
+
+
+# ---------------------------------------------------------------- Karten
+def map_europe(D, X, geo):
+    eg = D.get("eu_grid")
+    if not eg:
+        return None
+    P = Proj(MAPS["europa"]["bbox"], MAPS["europa"]["W"])
+    days = X["days"]
+    panes = []
+    for d in days:
+        pm = [[up_at(eg, f"e{la}_{lo}", "pressure_msl", d, 12) for lo in EU_LONS] for la in EU_LATS]
+        t8 = [[up_at(eg, f"e{la}_{lo}", "temperature_850hPa", d, 12) for lo in EU_LONS] for la in EU_LATS]
+        if sum(v is not None for r in pm for v in r) < 0.8 * len(EU_LATS) * len(EU_LONS):
+            continue
+        pos = []
+        ext = grid_extrema(P, pm, EU_LATS, EU_LONS, pos)
+        body = [svg_open(P, "eu"),
+                field_uri(P, t8, EU_LATS, EU_LONS, lambda v: band_color(v, T850_STOPS, 2, 225)),
+                grid_isolines(P, pm, EU_LATS, EU_LONS, range(940, 1064, 4), avoid=pos), ext, "</svg>"]
+        panes.append((f"{tab_label(d, days)}", "".join(body)))
+    if not panes:
+        return None
+    g = geo.get("europa", {}) if geo else {}
+    top = [svg_open(P, "eu top")]
+    for lat in range(40, 71, 10):
+        y = P.xy(lat, 0)[1]
+        top.append(f'<line x1="0" x2="{P.W}" y1="{y:.1f}" y2="{y:.1f}" class="grat"/>')
+    for lon in range(-20, 40, 10):
+        x = P.xy(50, lon)[0]
+        top.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="0" y2="{P.H}" class="grat"/>')
+    if g.get("coast"):
+        top.append(f'<path d="{path_d(P, g["coast"], tol=1.0)}" class="coastd"/>')
+    if g.get("borders"):
+        top.append(f'<path d="{path_d(P, g["borders"], tol=1.0)}" class="borderd"/>')
+    x, y = P.xy(LOCAL["riederalp"]["lat"], LOCAL["riederalp"]["lon"])
+    top.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.2" class="rmark"/>')
+    top.append(f'<text x="{P.W - 6}" y="{P.H - 8}" class="ilbl" text-anchor="end">12 UTC</text></svg>')
+    leg = legend_html([(f"background:rgb{band_color(t, T850_STOPS, 2, 255)[:3]}", f"{n(t)}")
+                       for t in range(-20, 25, 4)] + [("", "°C in 850 hPa")])
+    cap = ("Bodendruck (Isobaren alle 4 hPa, H Hoch, T Tief) und Temperatur in 850 hPa (Farbe) jeweils um 12 UTC, "
+           f"{MODEL_NAMES.get(D.get('eu_grid_model'), 'Globalmodell')} auf einem 3°-Raster. Die Isobaren sind dadurch geglättet; Randtiefs unter rund 500 km "
+           "Durchmesser fehlen. Punkt: Riederalp.")
+    return map_widget("eu", P, panes, top="".join(top), legend=leg), cap
+
+
+CH_LABELS = {"genf": "c", "neuchatel": "w", "basel": "c", "bern": "w", "luzern": "w", "zuerich": "c",
+             "stgallen": "e", "saentis": "w", "chur": "e", "davos": "e", "samedan": "e", "altdorf": "e",
+             "sion": "c", "lugano": "e", "locarno": "w", "jungfraujoch": "c", "riederalp": "e"}
+
+
+def map_swiss(D, X, geo, cache_dir):
+    P = Proj(MAPS["schweiz"]["bbox"], MAPS["schweiz"]["W"])
+    dem, dsrc = load_dem("schweiz", cache_dir)
+    base = base_layer(P, geo, "schweiz", dem, MAPS["schweiz"]["vex"])
+    sg, LD, days = D.get("ch_grid"), X["local"], X["days"][:3]
+    panes = []
+    for d in days:
+        body = [svg_open(P, "ov")]
+        if sg:
+            G = []
+            for la in CH_LATS:
+                row = []
+                for lo in CH_LONS:
+                    rec = sg.get(f"s{la}_{lo}")
+                    try:
+                        row.append(rec["v"]["precipitation_sum"][rec["d"].index(d)])
+                    except (TypeError, KeyError, ValueError, IndexError):
+                        row.append(None)
+                G.append(row)
+            if sum(v is not None for r in G for v in r) > 0.8 * len(CH_LATS) * len(CH_LONS):
+                body.append(field_uri(P, G, CH_LATS, CH_LONS, prec_color))
+        for k, anc in CH_LABELS.items():
+            st = LD[k].get(d)
+            if st:
+                sub = LOCAL[k]["name"] + (f", {n(st['snow'])} cm" if st["snow"] >= 1 else "")
+                body.append(station(P, k, f"{n(st['tmax'])}°", sub, anc, strong=(k == "riederalp")))
+        body.append("</svg>")
+        panes.append((tab_label(d, X["days"]), "".join(body)))
+    leg = legend_html([(f"background:rgb{c}", f"{n(t, 1 if t < 1 else 0)}") for t, c in PREC_BANDS]
+                      + [("", "mm pro Tag")])
+    model = MODEL_NAMES.get(D.get("ch_grid_model"), "Modell")
+    cap = (f"Niederschlag pro Tag (Farbe, {model} auf einem 0,2°-Raster, interpoliert) und Höchstwert an den Orten "
+           "des Berichts, bei Neuschnee mit Menge. Relief: " + (dsrc or "nicht verfügbar") +
+           "; Gewässer und Grenzen: Natural Earth.")
+    return map_widget("ch", P, panes, base=base, legend=leg), cap
+
+
+def region_levels(X, d, keys):
+    ss = [X["local"][k][d] for k in keys if X["local"][k].get(d)]
+    wet = [s["sfh_med"] for s in ss if s["prec"] >= 0.3 and s.get("sfh_med") is not None]
+    fz = [s["fzl_mean"] for s in ss if s.get("fzl_mean") is not None]
+    return (quant(wet, .5) if wet else None), (quant(fz, .5) if fz else None)
+
+
+def snow_panes(P, dem, X, keys, label_fn, group_levels, corner="tl"):
+    panes = []
+    for d in X["days"][:3]:
+        sfh, fzl = group_levels(d)
+        body = [svg_open(P, "ov")]
+        if dem and sfh is not None:
+            body.append(f'<image href="{snow_uri(dem, P, sfh)}" x="0" y="0" width="{P.W}" height="{P.H}" '
+                        'preserveAspectRatio="none"/>')
+            body.append(f'<path d="{dem_contour(dem, sfh)}" class="csfh"/>')
+        if dem and fzl is not None:
+            body.append(f'<path d="{dem_contour(dem, fzl)}" class="cfzl"/>')
+        body.extend(label_fn(d))
+        lines = [f"Schneefallgrenze {hm(sfh)}" if sfh is not None else "kein nennenswerter Niederschlag",
+                 f"Nullgradgrenze {hm(fzl)}"]
+        body.append(info_box(lines, P, corner))
+        body.append("</svg>")
+        panes.append((tab_label(d, X["days"]), "".join(body)))
+    return panes
+
+
+SNOW_LEGEND = [("background:#fff;border:1px solid var(--rule)", "Niederschlag als Schnee"),
+               ("height:0;border-top:2px solid var(--ice)", "Schneefallgrenze"),
+               ("height:0;border-top:2px dashed var(--contour)", "Nullgradgrenze")]
+
+
+def map_wallis(D, X, geo, cache_dir):
+    P = Proj(MAPS["wallis"]["bbox"], MAPS["wallis"]["W"])
+    dem, dsrc = load_dem("wallis", cache_dir)
+    keys = ["sion", "visp", "martigny", "zermatt", "simplon", "grimsel", "riederalp", "moosfluh"]
+    anchors = {"martigny": "c", "sion": "c", "visp": "w", "zermatt": "c", "simplon": "e", "grimsel": "w",
+               "riederalp": "e"}
+
+    def labels(d):
+        out = []
+        for k, anc in anchors.items():
+            st = X["local"][k].get(d)
+            if st:
+                sub = LOCAL[k]["name"] + (f", +{n(st['snow'])} cm" if st["snow"] >= 1 else "")
+                out.append(station(P, k, f"{n(st['tmax'])}°", sub, anc, strong=(k == "riederalp")))
+        return out
+
+    panes = snow_panes(P, dem, X, keys, labels, lambda d: region_levels(X, d, keys))
+    cap = ("Gelände oberhalb der mittleren Schneefallgrenze der Walliser Orte (weiss, nur an Tagen mit Niederschlag), "
+           "Schneefallgrenze und Nullgradgrenze als Höhenlinien; Zahlen: Höchstwert und Neuschnee. Die Grenzen sind "
+           "regionale Mittelwerte, im Stau und im Lee liegen sie oft mehrere hundert Meter auseinander. Relief: "
+           + (dsrc or "nicht verfügbar") + "; Gewässer und Grenzen: Natural Earth.")
+    return map_widget("vs", P, panes, base=base_layer(P, geo, "wallis", dem, MAPS["wallis"]["vex"]),
+                      legend=legend_html(SNOW_LEGEND)), cap
+
+
+RIED_NAMES = [("Bettmeralp", 46.3917, 8.0639), ("Eggishorn", 46.4278, 8.0922)]
+
+
+def map_ried(D, X, geo, cache_dir):
+    P = Proj(MAPS["riederalp"]["bbox"], MAPS["riederalp"]["W"])
+    dem, dsrc = load_dem("riederalp", cache_dir)
+    anchors = {"moerel": "e", "riederalp": "w", "moosfluh": "w", "jungfraujoch": "e"}
+
+    def labels(d):
+        out = []
+        for nm, la, lo in RIED_NAMES:
+            x, y = P.xy(la, lo)
+            out.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" class="sdot"/>'
+                       f'<text x="{x + 5:.1f}" y="{y + 4:.1f}" class="lbl ls">{nm}</text>')
+        for k, anc in anchors.items():
+            st = X["local"][k].get(d)
+            if st:
+                out.append(station(P, k, f"{n(st['tmin'])} / {n(st['tmax'])}°",
+                                   f"{LOCAL[k]['name']} {LOCAL[k]['elev']} m", anc, strong=(k == "riederalp")))
+        return out
+
+    def levels(d):
+        s = X["local"]["riederalp"].get(d)
+        if not s:
+            return None, None
+        return (s["sfh_med"] if s["prec"] >= 0.3 else None), s.get("fzl_mean")
+
+    panes = snow_panes(P, dem, X, ["riederalp"], labels, levels, corner="tr")
+    cap = ("Riederalp und Aletschgebiet: Gelände oberhalb der Schneefallgrenze der Riederalp (weiss, an Tagen mit "
+           "Niederschlag), Schneefallgrenze und Nullgradgrenze als Höhenlinien, Zahlen: Tiefst- und Höchstwert. Relief: "
+           + (dsrc or "nicht verfügbar") + ".")
+    return map_widget("ri", P, panes, base=base_layer(P, geo, "riederalp", dem, MAPS["riederalp"]["vex"]),
+                      legend=legend_html(SNOW_LEGEND)), cap
+
+
+def build_maps(D, X, cache_dir):
+    out = {}
+    try:
+        geo = load_geo(cache_dir)
+    except Exception as e:  # Karten sind Beiwerk: nie den Bericht gefährden
+        log(f"Geodaten ({type(e).__name__}: {e})")
+        geo = None
+    for key, fn, args in (("karte_europa", map_europe, (D, X, geo)),
+                          ("karte_schweiz", map_swiss, (D, X, geo, cache_dir)),
+                          ("karte_wallis", map_wallis, (D, X, geo, cache_dir)),
+                          ("karte_ried", map_ried, (D, X, geo, cache_dir))):
+        print(f"Zeichne {key} …", file=sys.stderr)
+        try:
+            res = fn(*args)
+            if res:
+                out[key] = res
+        except Exception as e:
+            log(f"Karte {key} ({type(e).__name__}: {e})")
+    return out
+
+
 # ================================================================ HTML
 def inline(s):
     s = html.escape(s, quote=False)
@@ -2209,11 +3087,14 @@ def md_to_html(md, charts):
 CSS = """
 :root{--paper:#eef1ec;--sheet:#f8f9f6;--ink:#1d2a2f;--muted:#566569;--rule:#c8cfc8;--contour:#9b6530;
 --ice:#2c6a95;--ice2:rgba(44,106,149,.16);--ice3:rgba(44,106,149,.30);--rain:#2a8577;--warm:#b0482c;color-scheme:light;
+--water:#b9d5e7;--water2:#6d9cbd;
 box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--paper:#11181b;--sheet:#172024;--ink:#dce4e5;--muted:#93a3a7;
---rule:#2c383c;--contour:#d49b5c;--ice:#7cb5dd;--ice2:rgba(124,181,221,.16);--ice3:rgba(124,181,221,.30);--rain:#6cc6b7;--warm:#e2876b;color-scheme:dark}}
+--rule:#2c383c;--contour:#d49b5c;--ice:#7cb5dd;--ice2:rgba(124,181,221,.16);--ice3:rgba(124,181,221,.30);--rain:#6cc6b7;--warm:#e2876b;color-scheme:dark;
+--water:#1f3b4a;--water2:#4b7f9c}}
 :root[data-theme="dark"]{--paper:#11181b;--sheet:#172024;--ink:#dce4e5;--muted:#93a3a7;--rule:#2c383c;--contour:#d49b5c;
---ice:#7cb5dd;--ice2:rgba(124,181,221,.16);--ice3:rgba(124,181,221,.30);--rain:#6cc6b7;--warm:#e2876b;color-scheme:dark}
+--ice:#7cb5dd;--ice2:rgba(124,181,221,.16);--ice3:rgba(124,181,221,.30);--rain:#6cc6b7;--warm:#e2876b;color-scheme:dark;
+--water:#1f3b4a;--water2:#4b7f9c}
 *{box-sizing:border-box}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.62 "Literata",Georgia,"Times New Roman",serif;
@@ -2268,6 +3149,53 @@ th{font-weight:600;color:var(--muted)}
 .meta{color:var(--muted);font-size:1.05rem;margin:0}
 .narr{border-left:3px solid var(--contour);padding:.2rem 0 .2rem 1rem;margin:1rem 0}
 footer{margin-top:3rem;color:var(--muted);font-size:.9rem}
+.mapw>input{position:absolute;opacity:0;width:1px;height:1px;pointer-events:none}
+.mapw>label{display:inline-block;font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;font-size:.92rem;
+padding:.15rem .65rem;margin:0 .3rem .5rem 0;border:1px solid var(--rule);border-radius:999px;cursor:pointer;color:var(--muted)}
+.mapw>input:checked+label{background:var(--ice);border-color:var(--ice);color:var(--sheet)}
+.mapw>input:focus-visible+label{outline:2px solid var(--ice);outline-offset:2px}
+.stack{position:relative;width:100%;border-radius:4px;overflow:hidden;background:var(--paper)}
+.stack>svg,.stack>.panes{position:absolute;inset:0;width:100%;height:100%}
+.panes>div{display:none;width:100%;height:100%}
+svg.maplayer{width:100%;height:100%;display:block}
+.mapw>input:nth-of-type(1):checked~.stack .panes>div:nth-child(1){display:block}
+.mapw>input:nth-of-type(2):checked~.stack .panes>div:nth-child(2){display:block}
+.mapw>input:nth-of-type(3):checked~.stack .panes>div:nth-child(3){display:block}
+.mapw>input:nth-of-type(4):checked~.stack .panes>div:nth-child(4){display:block}
+.mapw>input:nth-of-type(5):checked~.stack .panes>div:nth-child(5){display:block}
+.mapw>input:nth-of-type(6):checked~.stack .panes>div:nth-child(6){display:block}
+.mapw>input:nth-of-type(7):checked~.stack .panes>div:nth-child(7){display:block}
+.mapw>input:nth-of-type(8):checked~.stack .panes>div:nth-child(8){display:block}
+.mapw>input:nth-of-type(9):checked~.stack .panes>div:nth-child(9){display:block}
+.mapw>input:nth-of-type(10):checked~.stack .panes>div:nth-child(10){display:block}
+svg .lake{fill:var(--water)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) svg .tint{opacity:.45}}
+:root[data-theme="dark"] svg .tint{opacity:.45}
+svg .river{fill:none;stroke:var(--water2);stroke-width:1.1}
+svg .border{fill:none;stroke:var(--ink);stroke-width:.8;stroke-dasharray:4 2;opacity:.5}
+svg .sbar{stroke:var(--ink);stroke-width:2}
+svg .box{fill:var(--sheet);opacity:.86}
+svg .lbl{paint-order:stroke;stroke:var(--sheet);stroke-width:3px;stroke-linejoin:round}
+svg .lt{fill:var(--ink);font-size:12.5px;font-weight:600}
+svg .ls{fill:var(--muted);font-size:10.5px}
+svg .sdot{fill:var(--ink)}
+svg .sdot2{fill:var(--warm);stroke:var(--sheet);stroke-width:1.5}
+svg .csfh{fill:none;stroke:var(--ice);stroke-width:1.6}
+svg .cfzl{fill:none;stroke:var(--contour);stroke-width:1.6;stroke-dasharray:5 3}
+svg .isob{fill:none;stroke:#1c2328;stroke-width:.9}
+svg .ilbl{font-size:10px;fill:#1c2328;paint-order:stroke;stroke:rgba(255,255,255,.85);stroke-width:2.5px}
+svg .ext{font-size:16px;font-weight:700;paint-order:stroke;stroke:rgba(255,255,255,.9);stroke-width:3px}
+svg .extH{fill:#1f5f99}svg .extT{fill:#b0302a}
+svg .extv{font-size:10px;fill:#1c2328;paint-order:stroke;stroke:rgba(255,255,255,.85);stroke-width:2.5px}
+svg .coastd{fill:none;stroke:#26323a;stroke-width:.8}
+svg .borderd{fill:none;stroke:#26323a;stroke-width:.5;stroke-dasharray:2 2;opacity:.8}
+svg .grat{stroke:#26323a;stroke-width:.4;opacity:.25}
+svg .rmark{fill:#fff;stroke:#b0302a;stroke-width:2}
+.mlegend{display:flex;flex-wrap:wrap;gap:.25rem .7rem;font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;
+font-size:.86rem;color:var(--muted);padding:.55rem .2rem 0}
+.mlegend span{display:inline-flex;align-items:center;gap:.3rem}
+.mlegend i{display:inline-block;width:14px;height:10px;border-radius:2px}
+
 @media (max-width:520px){body{font-size:16px}h1{font-size:2.1rem}}
 """
 
@@ -2292,7 +3220,7 @@ def render_html(md, charts, X):
 <body>
 <main>
 {body}
-<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Kein offizieller Bericht von MeteoSchweiz.</footer>
+<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
 </main>
 </body>
 </html>"""
@@ -2364,6 +3292,7 @@ def main():
                  "\n\nFormuliert von Claude auf Grundlage der Diagnosen in diesem Bericht; Zahlen in den Tabellen sind massgeblich.\n")
         md = md.replace("<!--NARRATIV-->", block)
     charts = {"profil": svg_profile(X), "fan": svg_fan(X), "schnee": svg_snow(X)}
+    charts.update(build_maps(D, X, args.cache))
     os.makedirs(args.out, exist_ok=True)
     md_clean = re.sub(r"<!--[^>]*-->\n?", "", md)
     with open(os.path.join(args.out, "bericht.md"), "w", encoding="utf-8") as f:
