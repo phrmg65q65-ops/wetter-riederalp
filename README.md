@@ -8,6 +8,15 @@ Vier Karten mit Tagesauswahl: eine Bodendruckkarte Europas (Isobaren, Hoch und T
 
 Neben der klassischen Prognose rechnet das Skript Diagnosen, die in Standardberichten fehlen: Inversion Mörel–Riederalp, Föhnindex Lugano–Zürich, Feuchtefluss gegen den Alpenhauptkamm in 700 hPa, Hochnebelobergrenze, Bise, Trog- und Rückenachsen, geostrophische Höhenströmung, Strahlstromlage, Blockierung nach Tibaldi-Molteni, Saharastaub, Anomalie und Perzentil gegenüber 1991–2020 sowie KI-Ensemble (AIFS) gegen IFS-Ensemble.
 
+Dazu kommen Messwerte und Prüfungen:
+- **Messwerte:** die MeteoSchweiz-Stationen im Umkreis von 45 km, darunter Eggishorn, Jungfraujoch, Binn, Visp und Grimsel. Gezeigt werden die letzten 24 Stunden, der gemessene Temperaturgradient und der offizielle Föhnindex.
+- **Verifikation:** Die Prognosen der letzten 14 Tage werden mit den Messungen verglichen, getrennt nach 1, 2 und 3 Tagen Vorlauf. Dazu kommen die Abweichung in Tallagen gegenüber Hochlagen und ein Abgleich des aktuellen Laufs mit den Messungen seit Mitternacht.
+- **Prognosekonstanz:** wie sich die Vorhersage für die Riederalp über die letzten Läufe verschoben hat.
+- **Lawinen:** das SLF-Lawinenbulletin für die Warnregion 4214 Riederalp, in der Wintersaison.
+- **NAO-Proxy:** ein Index aus dem Bodendruck in Lissabon und Reykjavík, gemessen an ERA5 1991–2020.
+- **Zwei-Wochen-Tendenz:** aus dem ECMWF-Ensemble, als Wochenanomalien mit Wahrscheinlichkeiten.
+- **Praktisches:** UV-Index, Sonnenzeiten und eine Tabelle «Auf einen Blick».
+
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.
 
 ## Täglich als Webseite (GitHub Actions + Pages)
@@ -28,6 +37,8 @@ Optional: Ein Repository-Secret `ANTHROPIC_API_KEY` fügt eine von Claude formul
 python3 wetterbericht.py --out site
 ```
 
+Optional: Umgebungsvariable `OPEN_METEO_API_KEY` für einen kommerziellen Open-Meteo-Zugang. Das Skript nutzt dann die customer-Endpunkte mit höheren Limits.
+
 Python 3.9 oder neuer, nur Standardbibliothek (unter Windows zusätzlich `pip install tzdata`). Optionen: `--days 3..10`, `--cache ORDNER`, `--claude`.
 
 Ausgabe: `index.html` (Bericht mit Grafiken, hell/dunkel), `bericht.md` (gleicher Text) und `diagnostik.json` (alle Kennzahlen).
@@ -40,6 +51,6 @@ Orte stehen in `LOCAL` (die Schneetabelle in `SNOW_TABLE`), Vergleichsmodelle in
 
 ## Grenzen
 
-Das Skript wurde gegen nachgebildete Open-Meteo-Antworten getestet, nicht gegen die Live-API. Beim ersten echten Lauf lohnt sich ein Blick in den Abschnitt «Nicht verfügbar» und in `diagnostik.json`. Die Diagnosen sind bewusst einfach (10°-Raster für Z500, Punktwerte statt Felder) und ersetzen keine Analyse von Karten. Kein offizieller Bericht von MeteoSchweiz; Warnungen: meteoschweiz.admin.ch.
+Das Skript wurde gegen nachgebildete Antworten getestet, nicht gegen die Live-Schnittstellen. Die Formate der MeteoSchweiz-Dateien (Spalten, Zeitstempel, Stationsliste) habe ich an den echten Dateien geprüft. Den Dateipfad pro Station und die JSON-Adresse des SLF-Bulletins konnte ich nicht direkt testen. Fällt eine Quelle aus, erscheint sie unter «Nicht verfügbar»; der Rest des Berichts bleibt vollständig. Beim ersten echten Lauf lohnt sich ein Blick in den Abschnitt «Nicht verfügbar» und in `diagnostik.json`. Die Diagnosen sind bewusst einfach (10°-Raster für Z500, Punktwerte statt Felder) und ersetzen keine Analyse von Karten. Kein offizieller Bericht von MeteoSchweiz; Warnungen: meteoschweiz.admin.ch.
 
 Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus).

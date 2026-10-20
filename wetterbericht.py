@@ -47,7 +47,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.2"
+VERSION = "1.3"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -176,7 +176,8 @@ ENS_VARS = ["temperature_2m", "precipitation", "snowfall", "cloud_cover_low", "s
 SNOW_TABLE = ["moerel", "simplon", "zermatt", "riederalp", "grimsel", "moosfluh"]  # nach Höhe
 UPPER_MODELS = ["ecmwf_ifs025", "gfs_global", "icon_global"]  # Druckflächen; Ersatzmodelle bei Ausfall
 MODEL_NAMES = {"ecmwf_ifs025": "ECMWF IFS 0,25°", "gfs_global": "NOAA GFS 0,25°", "icon_global": "DWD ICON global",
-               "meteoswiss_icon_seamless": "ICON-CH", "ecmwf_ifs": "ECMWF IFS 9 km"}
+               "meteoswiss_icon_seamless": "ICON-CH", "ecmwf_ifs": "ECMWF IFS 9 km",
+               "best_match": "Open-Meteo Best Match"}
 UPPER_VARS = ["pressure_msl", "geopotential_height_500hPa", "temperature_850hPa",
               "wind_speed_250hPa", "temperature_700hPa", "relative_humidity_700hPa",
               "wind_speed_700hPa", "wind_direction_700hPa"]
@@ -194,7 +195,13 @@ class ApiError(Exception):
     pass
 
 
+OM_KEY = os.environ.get("OPEN_METEO_API_KEY")  # optional: kommerzieller Zugang, höhere Limits
+
+
 def fetch_json(url, params=None, timeout=90, retries=4, quiet=False):
+    if OM_KEY and "open-meteo.com" in url and "/data/" not in url:
+        url = url.replace("://", "://customer-", 1) if "://customer-" not in url else url
+        params = {**(params or {}), "apikey": OM_KEY}
     full = url + ("?" + urllib.parse.urlencode(params, safe=",:") if params else "")
     last = None
     for attempt in range(retries):
@@ -289,7 +296,8 @@ def fetch_model(api, label, candidates, params, keys, days, factor=1.0, parser=N
     weight = len(keys) * max(1, math.ceil(nvars / 10)) * max(1, math.ceil(params.get("forecast_days", 7) / 14)) * factor
     for mid in candidates:
         p = dict(params)
-        p["models"] = mid
+        if mid:
+            p["models"] = mid
         try:
             rate_budget(weight)
             data = fetch_json(api, p)
@@ -381,8 +389,36 @@ def collect(days, cache_dir):
     except ApiError as e:
         log(f"CAMS-Aerosol ({e})")
 
+    print("Lade UV und Sonnenzeiten …", file=sys.stderr)
+    _m, D["sun"] = fetch_model(API_FC, "UV und Sonnenzeiten", ["best_match"],
+                               {**coords(["riederalp"], LOCAL), "daily": "uv_index_max,sunrise,sunset,daylight_duration",
+                                "timezone": TZNAME, "forecast_days": nd}, ["riederalp"], days, parser=parse_daily)
+    print("Lade Prognosekonstanz Riederalp …", file=sys.stderr)
+    hv = "temperature_2m,precipitation," + ",".join(f"{v}_previous_day{k}" for v in ("temperature_2m", "precipitation")
+                                                    for k in (1, 2, 3))
+    D["prev_ried_model"], pr = fetch_model(API_PREV, "Prognosekonstanz Riederalp",
+                                           ["meteoswiss_icon_seamless", "ecmwf_ifs", "best_match"],
+                                           {**coords(["riederalp"], LOCAL), "hourly": hv, "timezone": TZNAME,
+                                            "forecast_days": 5}, ["riederalp"], days)
+    D["prev_ried"] = pr["riederalp"] if pr else None
+    print("Lade ECMWF ENS bis 15 Tage …", file=sys.stderr)
+    d15 = [days[0] + dt.timedelta(k) for k in range(16)]
+    _m, e15 = fetch_model(API_ENS, "ECMWF ENS 15 Tage", ["ecmwf_ifs025", "ecmwf_ifs025_ensemble"],
+                          {**coords(["riederalp"], LOCAL), "hourly": "temperature_2m,precipitation",
+                           "timezone": TZNAME, "forecast_days": 15}, ["riederalp"], d15, factor=5)
+    D["ens15"] = e15["riederalp"] if e15 else None
+    D["obs"] = collect_obs(cache_dir)
+    D["slf"] = collect_slf()
+
     print("Klimatologie ERA5-Land …", file=sys.stderr)
-    D["clim"] = clim_fetch(cache_dir, days)
+    D["clim"] = clim_fetch(cache_dir, d15)
+    try:
+        months = sorted({(d + dt.timedelta(k)).month for d in days for k in (-7, 0, 7)})
+        D["nao_clim"] = archive_months(cache_dir, "klima_nao_era5_v1.json", NAO_PTS, list(NAO_PTS),
+                                       ["pressure_msl_mean"], months, ["era5", ""])
+    except (ApiError, OSError) as e:
+        log(f"NAO-Klimatologie ({e})")
+        D["nao_clim"] = None
 
     print("Modell-Laufzeiten …", file=sys.stderr)
     D["runtimes"] = {}
@@ -993,6 +1029,37 @@ def diagnose(D, days, now):
     return X
 
 
+def diagnose_extra(D, X):
+    now_utc = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    O = D.get("obs") or {}
+    X["obs"] = []
+    for st in O.get("stations", []):
+        sm = obs_summary(O.get("now", {}).get(st["abbr"]), now_utc)
+        if sm:
+            X["obs"].append({**st, **sm})
+    X["obs_lapse"] = None
+    pts = [(o["elev"], o["T"], o["tT"], o["name"]) for o in X["obs"] if o["T"] is not None]
+    if len(pts) >= 2:
+        tl = max(q[2] for q in pts)
+        cur = sorted((q for q in pts if q[2] == tl), key=lambda q: q[0])
+        if len(cur) >= 2 and cur[-1][0] - cur[0][0] >= 800:
+            X["obs_lapse"] = {"lo": cur[0], "hi": cur[-1], "t": tl,
+                              "rate": (cur[-1][1] - cur[0][1]) / (cur[-1][0] - cur[0][0]) * 1000}
+    X["verif"], X["verif_model"] = (verify(O) if O else None), O.get("prev_model")
+    X["consist"] = consistency(D["prev_ried"], X["days"]) if D.get("prev_ried") else {}
+    X["consist_model"] = D.get("prev_ried_model")
+    X["slf"], X["slf_level"] = D.get("slf"), slf_level(D.get("slf"))
+    X["nao"] = nao_proxy(D, X, D.get("nao_clim"))
+    X["weeks"] = week_trend(D["ens15"], D["clim"], X) if D.get("ens15") else []
+    X["sun"] = {}
+    sr = (D.get("sun") or {}).get("riederalp")
+    if sr:
+        for i, d in enumerate(sr["d"]):
+            g = lambda k: (sr["v"].get(k) or [None] * len(sr["d"]))[i]
+            hh = lambda x: str(x)[11:16] if x and "T" in str(x) else None
+            X["sun"][d] = {"uv": g("uv_index_max"), "rise": hh(g("sunrise")), "set": hh(g("sunset"))}
+
+
 def best_ens(X, loc, d, prefer=("ICON-CH1-EPS", "ICON-CH2-EPS", "ECMWF ENS", "NOAA GEFS")):
     for lab in prefer:
         st = (X["ens"].get(lab, {}).get(loc) or {}).get(d)
@@ -1227,6 +1294,7 @@ def build_report(X):
     if runs:
         A(f"Modellläufe: {join_de(runs)}.")
         A("")
+    out.extend(glance(X))
     A("<!--CHART:profil-->")
     A("")
 
@@ -1282,6 +1350,14 @@ def build_report(X):
             word = "über" if cl["anom_tmax"] >= 0 else "unter"
             parts.append(f"Der Höchstwert liegt {n(abs(cl['anom_tmax']), 1)} K {word} dem Mittel 1991–2020 "
                          f"({int(round(cl['rank_tmax'] * 100))}. Perzentil).")
+        sn = X.get("sun", {}).get(d)
+        if sn and sn.get("rise"):
+            t = f"Sonne astronomisch von {sn['rise']} bis {sn['set']} Uhr (ohne Horizontabschattung)"
+            if sn.get("uv") is not None:
+                t += f", UV-Index bis {n(sn['uv'])}"
+                if sn["uv"] >= 3 and (s.get("sd_end") or 0) >= 5:
+                    t += "; Schnee reflektiert zusätzlich bis zu 80 % der UV-Strahlung"
+            parts.append(t + ".")
         cf = X["conf"].get(d)
         if cf:
             parts.append(f"Prognosesicherheit {cf['label']}.")
@@ -1291,6 +1367,7 @@ def build_report(X):
         A("")
     A("<!--CHART:karte_ried-->")
     A("")
+    out.extend(obs_section(X))
     if len(days) > 2:
         A("### Folgetage")
         A("")
@@ -1380,9 +1457,24 @@ def build_report(X):
         for d in days[1:]:
             e = X["eu"].get(d)
             if e:
-                A(f"- **{dshort(d)}** {europe_short(e, prev)}")
+                nv = X.get("nao", {}).get(d)
+                A(f"- **{dshort(d)}** {europe_short(e, prev)}" + (f" NAO-Proxy {sgn(nv)}." if nv is not None else ""))
                 prev = e
         A("")
+        nao = list(X.get("nao", {}).values())
+        if len(nao) >= 3:
+            m = sum(nao) / len(nao)
+            if m >= 1:
+                ph = ("positive Phase: kräftige Westdrift, Tiefs ziehen nördlich vorbei, die Alpensüdseite bleibt "
+                      "eher trocken")
+            elif m <= -1:
+                ph = ("negative Phase: blockierte oder südwärts verlagerte Zugbahnen, Mittelmeertiefs und Südstau am "
+                      "Alpenhauptkamm werden wahrscheinlicher")
+            else:
+                ph = "keine ausgeprägte Phase"
+            A(f"NAO-Proxy (Bodendruck Lissabon minus Reykjavík, je standardisiert gegen ERA5 1991–2020) im Mittel des "
+              f"Zeitraums {sgn(m)}: {ph}. Einzelne Tageswerte dieses Stationsindex streuen stark.")
+            A("")
     else:
         A("Druckflächendaten nicht verfügbar.")
         A("")
@@ -1402,6 +1494,179 @@ def build_report(X):
     A("")
     out.extend(method_section(X))
     return "\n".join(out)
+
+
+def glance(X):
+    days, LD = X["days"], X["local"]["riederalp"]
+    cols = [d for d in days[:3] if LD.get(d)]
+    if not cols:
+        return []
+    lab = lambda d: "Heute" if d == days[0] else ("Morgen" if d == days[1] else dshort(d))
+    rows = ["| Riederalp | " + " | ".join(lab(d) for d in cols) + " |", "|---|" + "---|" * len(cols)]
+
+    def row(name, fn):
+        rows.append(f"| {name} | " + " | ".join(fn(LD[d], d) for d in cols) + " |")
+
+    def ens(d):
+        e = best_ens(X, "riederalp", d)
+        return e[1] if e else {}
+
+    row("Wetter", lambda s, d: sky_word(s) + (f", {prec_kind(s)}" if s["prec"] >= 0.3 else ""))
+    row("Temperatur", lambda s, d: f"{n(s['tmin'])} / {n(s['tmax'])} °C")
+    row("Niederschlag", lambda s, d: f"{n(s['prec'], 1)} mm" + (f" ({pct(ens(d)['p1'])})" if ens(d).get("p1") is not None else ""))
+    row("Neuschnee", lambda s, d: f"{n(s['snow'])} cm")
+    row("Schneefall- / 0°-Grenze", lambda s, d: (hm(s["sfh_med"]) if s["prec"] >= 0.3 and s.get("sfh_med") else "–")
+        + f" / {hm(s['fzl_mean'])}")
+    row("Böen", lambda s, d: f"{n(s['gust'])} km/h" if s.get("gust") is not None else "–")
+    row("Sicherheit", lambda s, d: X["conf"].get(d, {}).get("label", "–"))
+    return rows + ["", "Niederschlag mit Ensemble-Wahrscheinlichkeit für mindestens 1 mm.", ""]
+
+
+def obs_section(X):
+    out = []
+    A = out.append
+    if X.get("obs"):
+        A("### Gemessen in der Region")
+        A("")
+        A("| Station | Jetzt | Min / Max 24 h | Niederschlag 24 h | Schnee | Böen | Föhn |")
+        A("|---|---|---|---|---|---|---|")
+        tts = [o["tT"] for o in X["obs"] if o.get("tT")]
+        tlast = max(tts).replace(tzinfo=dt.timezone.utc).astimezone(TZ) if tts else None
+        for o in X["obs"]:
+            A(f"| {o['name']}, {int(o['elev'])} m | {deg(o['T'], 1)} | "
+              f"{n(o['tmin'], 1)} / {n(o['tmax'], 1)} °C | {n(o['prec'], 1)} mm | "
+              f"{(n(o['sd']) + ' cm') if o.get('sd') is not None else '–'} | "
+              f"{(n(o['gust']) + ' km/h') if o.get('gust') is not None else '–'} | "
+              f"{(n(o['foehn_h'], 1) + ' h') if o.get('foehn_h') else '–'} |")
+        A("")
+        bits = []
+        L = X.get("obs_lapse")
+        if L:
+            r = L["rate"]
+            kind = ("stabil geschichtet bis invers" if r > -3 else
+                    ("nahezu trockenadiabatisch" if r < -8.5 else "im Bereich der Standardatmosphäre"))
+            tl = L["t"].replace(tzinfo=dt.timezone.utc).astimezone(TZ)
+            bits.append(f"Gemessener Temperaturgradient zwischen {L['lo'][3]} ({int(L['lo'][0])} m) und {L['hi'][3]} "
+                        f"({int(L['hi'][0])} m) um {tl:%H:%M} Uhr: {sgn(r)} K/km, {kind}.")
+        fo = [o for o in X["obs"] if (o.get("foehn_h") or 0) >= 1]
+        if fo:
+            bits.append("Föhn gemessen (Föhnindex MeteoSchweiz, letzte 24 h): "
+                        + join_de([f"{o['name']} {n(o['foehn_h'], 1)} h" for o in fo]) + ".")
+        wet = sorted((o for o in X["obs"] if (o.get("prec") or 0) >= 1), key=lambda o: -o["prec"])
+        if wet:
+            bits.append("Am meisten Niederschlag: " + join_de([f"{o['name']} {n(o['prec'], 1)} mm" for o in wet[:3]]) + ".")
+        nw = (X.get("verif") or {}).get("now")
+        if nw:
+            bits.append(f"Der aktuelle Lauf ({MODEL_NAMES.get(X.get('verif_model'), X.get('verif_model'))}) liegt heute seit Mitternacht UTC an diesen Stationen im "
+                        f"Mittel {sgn(nw['bias'])} K neben den Messungen (mittlerer Absolutfehler {n(nw['mae'], 1)} K, "
+                        f"{nw['n']} Stundenwerte).")
+        if bits:
+            A(" ".join(bits))
+            A("")
+        A("Messwerte: MeteoSchweiz, Stationen im Umkreis von 45 km um die Riederalp"
+          + (f"; «Jetzt» ist der letzte Stundenwert ({tlast:%H:%M} Uhr)." if tlast else "."))
+        A("")
+    A("### Lawinen")
+    A("")
+    A(slf_text(X.get("slf")))
+    A("")
+    return out
+
+
+def verif_section(X):
+    out = []
+    A = out.append
+    V = X.get("verif")
+    if V and any(V.get(L, {}).get("tx") for L in (1, 2, 3)):
+        A("### Verifikation der letzten 14 Tage")
+        A("")
+        A(f"Frühere Läufe von {MODEL_NAMES.get(X.get('verif_model'), X.get('verif_model'))} an den MeteoSchweiz-Stationen der Region gegen die gemessenen "
+          "Tageswerte; Fehler als Prognose minus Messung.")
+        A("")
+        A("| Vorlauf | Tmax Bias / MAE | Tmin Bias / MAE | ≥ 1 mm: Treffer / Fehlalarme | n |")
+        A("|---|---|---|---|---|")
+        for L in (1, 2, 3):
+            v = V.get(L) or {}
+            tx, tn = v.get("tx"), v.get("tn")
+            if not tx:
+                continue
+            A(f"| {L} Tag{'e' if L > 1 else ''} | {sgn(tx['bias'])} / {n(tx['mae'], 1)} K | "
+              f"{(sgn(tn['bias']) + ' / ' + n(tn['mae'], 1) + ' K') if tn else '–'} | "
+              f"{pct(v.get('pod'))} / {pct(v.get('far'))} | {tx['n']} |")
+        A("")
+        v1 = V.get(1) or {}
+        lo, hi = v1.get("tn_low"), v1.get("tn_high")
+        bits = []
+        if lo and hi and abs(lo["bias"] - hi["bias"]) >= 1:
+            dd = lo["bias"] - hi["bias"]
+            what = (f"gegenüber den Hochlagen sind die Tallagen nachts um {n(abs(dd), 1)} K zu warm vorhergesagt, ein "
+                    "Hinweis auf unterschätzte Kaltluftseen" if dd > 0 else
+                    f"gegenüber den Hochlagen sind die Tallagen nachts um {n(abs(dd), 1)} K zu kalt vorhergesagt, die "
+                    "nächtliche Auskühlung der Täler wird überschätzt")
+            bits.append(f"Tiefstwerte am Folgetag: in Lagen unter 1200 m {sgn(lo['bias'])} K, über 2000 m "
+                        f"{sgn(hi['bias'])} K; {what}.")
+        bits.append("Grenzen: Messextreme stammen aus 10-Minuten-Werten, Modellextreme aus Stundenwerten, was "
+                    "Höchstwerte im Modell leicht drückt und Tiefstwerte leicht anhebt; Tage in UTC; kleine Stichprobe.")
+        A(" ".join(bits))
+        A("")
+    C = X.get("consist")
+    if C:
+        A("### Prognosekonstanz Riederalp")
+        A("")
+        A(f"Höchstwert und Niederschlag für die Riederalp, wie sie {MODEL_NAMES.get(X.get('consist_model'), X.get('consist_model'))} in den Läufen von heute und "
+          "den Vortagen vorhergesagt hat.")
+        A("")
+        A("| Tag | aktuell | vor 1 Tag | vor 2 Tagen | vor 3 Tagen |")
+        A("|---|---|---|---|---|")
+        jumps, big = [], None
+        for d, row in C.items():
+            cells = [f"{n(row[L][0])} °C; {n(row[L][1], 1)} mm" if L in row else "" for L in (0, 1, 2, 3)]
+            A(f"| {dshort(d)} | " + " | ".join(cells) + " |")
+            if 0 in row and 1 in row:
+                jumps.append(abs(row[0][0] - row[1][0]))
+            far = max((L for L in row if L > 0), default=None)
+            if far and 0 in row:
+                dd = row[0][0] - row[far][0]
+                if big is None or abs(dd) > abs(big[1]):
+                    big = (d, dd, far)
+        A("")
+        bits = []
+        if jumps:
+            bits.append(f"Mittlere Änderung des Höchstwerts gegenüber dem Vortageslauf: {n(sum(jumps) / len(jumps), 1)} K.")
+        if big and abs(big[1]) >= 1:
+            bits.append(f"Grösste Verschiebung: {dshort(big[0])} um {sgn(big[1])} K gegenüber dem Lauf von vor "
+                        f"{big[2]} Tag{'en' if big[2] > 1 else ''}.")
+        if bits:
+            A(" ".join(bits))
+            A("")
+    return out
+
+
+def week_section(X):
+    W = X.get("weeks")
+    if not W:
+        return []
+    out = [f"### Tendenz bis {dlong(W[-1]['to'])}", "",
+           "ECMWF-Ensemble für die Riederalp, Wochenmittel des Höchstwerts und Wochensumme des Niederschlags gegenüber "
+           "1991–2020.", "",
+           "| Zeitraum | Höchstwert gegenüber Mittel | wärmer | ≥ +2 K | ≤ −2 K | Niederschlag (Median / Mittel) | nasser |",
+           "|---|---|---|---|---|---|---|"]
+    for w in W:
+        a = w["an"]
+        pr = (f"{n(w['pr']['p50'])} / {n(w['clim_pr'])} mm" if w.get("pr") and w.get("clim_pr") else "–")
+        out.append(f"| {dshort(w['from'])} bis {dshort(w['to'])} | {sgn(a['p50'])} K ({sgn(a['p10'])} … {sgn(a['p90'])}) | "
+                   f"{pct(w['p_warm'])} | {pct(w['p_w2'])} | {pct(w['p_c2'])} | {pr} | {pct(w.get('p_wet'))} |")
+    out.append("")
+    w2 = W[-1]
+    if w2["p_warm"] is not None:
+        if w2["p_warm"] >= 0.8:
+            t = f"Für {w2['label']} deutet das Ensemble klar auf überdurchschnittliche Temperaturen hin."
+        elif w2["p_warm"] <= 0.2:
+            t = f"Für {w2['label']} deutet das Ensemble klar auf unterdurchschnittliche Temperaturen hin."
+        else:
+            t = f"Für {w2['label']} zeigt das Ensemble kein eindeutiges Temperatursignal."
+        out += [t + " Bei diesem Vorlauf ist die Ensemble-Wahrscheinlichkeit aussagekräftiger als der Median.", ""]
+    return out
 
 
 def night_text(X):
@@ -1699,6 +1964,9 @@ def europe_text(X, d):
                      "blockierte Strömung, das erhöht die Persistenz der Lage.")
     elif e.get("tm"):
         parts.append("Kein blockierter Sektor zwischen 20° W und 30° E (Tibaldi-Molteni).")
+    nv = X.get("nao", {}).get(d)
+    if nv is not None:
+        parts.append(f"NAO-Proxy heute {sgn(nv)}.")
     if e.get("t850_alps") is not None:
         t = f"Temperatur in 850 hPa über den Alpen {deg(e['t850_alps'])}"
         if e.get("t850max"):
@@ -1825,6 +2093,27 @@ def insights(X):
         else:
             continue
         break
+    lv = X.get("slf_level")
+    if lv and lv >= 2:
+        word = {2: "mässig", 3: "erheblich", 4: "gross", 5: "sehr gross"}[lv]
+        I.append((9 if lv >= 3 else 5, f"Lawinengefahr in der Region Riederalp: Stufe {lv}, {word} (SLF)."))
+    fo = sorted((o for o in X.get("obs", []) if (o.get("foehn_h") or 0) >= 3), key=lambda o: -o["foehn_h"])
+    if fo:
+        I.append((6, f"Föhn gemessen: {fo[0]['name']} {n(fo[0]['foehn_h'], 1)} h in den letzten 24 h."))
+    v1 = ((X.get("verif") or {}).get(1) or {}).get("tx")
+    if v1 and v1["n"] >= 20 and abs(v1["bias"]) >= 1.5:
+        I.append((4, f"Verifikation: Höchstwerte am Folgetag lagen in den letzten 14 Tagen im Mittel {sgn(v1['bias'])} K "
+                     "neben den Messungen der Region."))
+    jmp = [(d, r[0][0] - r[1][0]) for d, r in (X.get("consist") or {}).items()
+           if 0 in r and 1 in r and 1 <= (d - days[0]).days <= 3]
+    if jmp:
+        d_, dd = max(jmp, key=lambda x: abs(x[1]))
+        if abs(dd) >= 4:
+            I.append((5, f"Prognosesprung: Höchstwert Riederalp für {dshort(d_)} {sgn(dd)} K gegenüber dem Vortageslauf."))
+    for w in X.get("weeks") or []:
+        if w["label"] == "Woche 2" and w["p_warm"] is not None and (w["p_warm"] >= 0.8 or w["p_warm"] <= 0.2):
+            I.append((5, f"Tendenz {dshort(w['from'])} bis {dshort(w['to'])}: mit {pct(max(w['p_warm'], 1 - w['p_warm']))} "
+                         f"{'wärmer' if w['p_warm'] >= 0.5 else 'kälter'} als 1991–2020 (Median {sgn(w['an']['p50'])} K)."))
     blk = [d for d in days if X["eu"].get(d, {}).get("blocked")]
     if blk:
         I.append((6, f"Blockierung (Tibaldi-Molteni) ab {dshort(blk[0])} bei "
@@ -1912,6 +2201,7 @@ def uncertainty_section(X):
                 for d, v in rs) + ". Beide Systeme laufen auf 0,25°; Unterschiede im Spread sagen etwas über die "
                 "Kalibrierung, nicht automatisch über die Treffsicherheit.")
             A("")
+    out.extend(verif_section(X))
     if X["horizon"]:
         A(f"Vorhersagbarkeitsgrenze für die Riederalp in diesem Lauf: ab {dlong(X['horizon'])}.")
     else:
@@ -1953,6 +2243,7 @@ def clim_section(X):
       "ungefähr einem normalen Tag. Prognose und Reanalyse sind nicht gegeneinander biaskorrigiert, "
       "in steilem Gelände sind ±1–2 K Unsicherheit in der Anomalie realistisch.")
     A("")
+    out.extend(week_section(X))
     return out
 
 
@@ -1987,6 +2278,15 @@ def method_section(X):
       "aus ICON-CH auf einem 0,2°-Raster, bilinear interpoliert. Wallis und Riederalp: Relief aus Terrain Tiles "
       "(Mapzen, AWS Open Data; Ersatz: Open-Meteo-Höhenmodell), Schneefallgrenze und Nullgradgrenze als Höhenlinien "
       "des Reliefs. Gewässer und Grenzen: Natural Earth.")
+    A("")
+    A("**Messungen und Verifikation:** Stationswerte von MeteoSchweiz (Open Data, Quelle: MeteoSchweiz) im Umkreis "
+      "von 45 km um die Riederalp; Föhnindex wcc006 von MeteoSchweiz. Verifikation mit der Previous-Runs-API von "
+      "Open-Meteo: Prognosen, die 1, 2 und 3 Tage vor dem jeweiligen Tag erstellt wurden, gegen gemessene Tageswerte "
+      "(Tmax, Tmin, Niederschlag 0–0 UTC). Prognosekonstanz: dieselbe API für die Riederalp.")
+    A("")
+    A("**Lawinen:** CAAML-Bulletin des SLF für die Warnregion 4214 Riederalp; massgebend ist immer das Bulletin auf "
+      "slf.ch. **NAO-Proxy:** tägliches Mittel des Bodendrucks in Lissabon und Reykjavík, je standardisiert gegen "
+      "ERA5 1991–2020 (±7 Tage), Differenz nach Hurrell. **Tendenz:** ECMWF ENS bis 15 Tage gegen ERA5-Land.")
     A("")
     A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
@@ -2212,6 +2512,459 @@ def svg_fan(X):
     return "\n".join(p), cap
 
 
+# ================================================================ Messungen, Verifikation, Lawinen, NAO
+SMN_BASE = "https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn"
+SMN_STAC = "https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-smn/items/{}"
+API_PREV = "https://previous-runs-api.open-meteo.com/v1/forecast"
+SLF_URLS = ("https://aws.slf.ch/api/bulletin/caaml/de/json",
+            "https://aws.slf.ch/api/bulletin/caaml/json?lang=de")
+SLF_REGION = "4214"  # SLF-Warnregion Riederalp
+OBS_RADIUS_KM, OBS_MAX, VERIF_DAYS = 45, 10, 14
+NAO_PTS = {"lis": _p("Lissabon", 38.72, -9.14), "rey": _p("Reykjavík", 64.15, -21.94)}
+DANGER = {"low": (1, "gering"), "moderate": (2, "mässig"), "considerable": (3, "erheblich"),
+          "high": (4, "gross"), "very_high": (5, "sehr gross")}
+PROBLEMS = {"new_snow": "Neuschnee", "wind_slab": "Triebschnee", "persistent_weak_layers": "Altschnee",
+            "wet_snow": "Nassschnee", "gliding_snow": "Gleitschnee", "cornices": "Wechten",
+            "favourable_situation": "günstige Situation", "no_distinct_avalanche_problem": "kein ausgeprägtes Problem"}
+
+
+def km(la1, lo1, la2, lo2):
+    p1, p2 = math.radians(la1), math.radians(la2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lo2 - lo1) / 2) ** 2
+    return 12742 * math.asin(math.sqrt(min(1.0, a)))
+
+
+def parse_smn(text):
+    """MeteoSchweiz-OGD-CSV (Semikolon, Zeitstempel dd.mm.yyyy HH:MM in UTC)."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    head = [h.strip() for h in lines[0].split(";")]
+    it = head.index("reference_timestamp")
+    cols = [h for h in head if h not in ("station_abbr", "reference_timestamp")]
+    out = {"t": [], **{h: [] for h in cols}}
+    for ln in lines[1:]:
+        c = [x.strip() for x in ln.split(";")]
+        c += [""] * (len(head) - len(c))
+        try:
+            t = dt.datetime.strptime(c[it], "%d.%m.%Y %H:%M")
+        except ValueError:
+            continue
+        out["t"].append(t)
+        for h, v in zip(head, c):
+            if h in out and h != "t":
+                try:
+                    out[h].append(float(v) if v else None)
+                except ValueError:
+                    out[h].append(None)
+    return out
+
+
+def smn_get(abbr, gran, upd):
+    a = abbr.lower()
+    name = f"ogd-smn_{a}_{gran}_{upd}.csv"
+    try:
+        return parse_smn(fetch_bytes(f"{SMN_BASE}/{a}/{name}").decode("cp1252", "replace"))
+    except ApiError:
+        item = fetch_json(SMN_STAC.format(a), retries=1, quiet=True)
+        assets = item.get("assets", {})
+        href = (assets.get(name) or {}).get("href") or next(
+            (v.get("href") for k, v in assets.items() if k.endswith(f"_{gran}_{upd}.csv")), None)
+        if not href:
+            raise ApiError(f"{name} nicht gefunden")
+        return parse_smn(fetch_bytes(href).decode("cp1252", "replace"))
+
+
+def smn_stations(cache_dir):
+    path = os.path.join(cache_dir, "smn_stationen_v1.json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 30 * 86400:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    text = fetch_bytes(f"{SMN_BASE}/ogd-smn_meta_stations.csv").decode("cp1252", "replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    head = lines[0].split(";")
+    need = ("station_abbr", "station_name", "station_height_masl",
+            "station_coordinates_wgs84_lat", "station_coordinates_wgs84_lon")
+    if not all(k in head for k in need):
+        raise ApiError("Stationsliste in unbekanntem Format")
+    ix = {k: head.index(k) for k in need}
+    out = []
+    for ln in lines[1:]:
+        c = ln.split(";")
+        try:
+            out.append({"abbr": c[ix["station_abbr"]], "name": c[ix["station_name"]],
+                        "elev": float(c[ix["station_height_masl"]]),
+                        "lat": float(c[ix["station_coordinates_wgs84_lat"]]),
+                        "lon": float(c[ix["station_coordinates_wgs84_lon"]])})
+        except (ValueError, IndexError):
+            continue
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f)
+    return out
+
+
+def collect_obs(cache_dir):
+    O = {"stations": [], "now": {}, "recent": {}, "prev": None, "prev_model": None}
+    print("Lade Messwerte MeteoSchweiz …", file=sys.stderr)
+    try:
+        st = smn_stations(cache_dir)
+    except (ApiError, OSError) as e:
+        log(f"MeteoSchweiz-Stationsliste ({e})")
+        return O
+    R = LOCAL["riederalp"]
+    near = sorted(({**s, "km": km(R["lat"], R["lon"], s["lat"], s["lon"])} for s in st), key=lambda s: s["km"])
+    O["stations"] = [s for s in near if s["km"] <= OBS_RADIUS_KM][:OBS_MAX]
+    for s in O["stations"]:
+        for gran, upd in (("h", "now"), ("d", "recent")):
+            try:
+                O["now" if upd == "now" else "recent"][s["abbr"]] = smn_get(s["abbr"], gran, upd)
+            except (ApiError, ValueError) as e:
+                log(f"MeteoSchweiz {s['abbr']} {gran}_{upd} ({e})")
+            time.sleep(0.2)
+    if O["stations"]:
+        print("Lade frühere Modellläufe für die Verifikation …", file=sys.stderr)
+        tab = {s["abbr"]: _p(s["name"], s["lat"], s["lon"], int(round(s["elev"]))) for s in O["stations"]}
+        keys = list(tab)
+        today = dt.datetime.now(dt.timezone.utc).date()
+        vdays = [today - dt.timedelta(k) for k in range(VERIF_DAYS + 1, -2, -1)]
+        hv = ",".join(f"{v}_previous_day{k}" for v in ("temperature_2m", "precipitation") for k in (1, 2, 3))
+        params = {**coords(keys, tab), "hourly": hv + ",temperature_2m", "timezone": "GMT",
+                  "past_days": VERIF_DAYS + 1, "forecast_days": 1}
+        O["prev_model"], O["prev"] = fetch_model(API_PREV, "Verifikation (frühere Läufe)",
+                                                 ["meteoswiss_icon_seamless", "ecmwf_ifs", "best_match"],
+                                                 params, keys, vdays)
+    return O
+
+
+def _col(rec, name, i):
+    arr = rec.get(name) or []
+    return arr[i] if i < len(arr) else None
+
+
+def obs_summary(o, now_utc):
+    if not o or not o.get("t"):
+        return None
+    t0 = now_utc - dt.timedelta(hours=24)
+    idx = [i for i, t in enumerate(o["t"]) if t > t0]
+
+    def last(name):
+        arr = o.get(name) or []
+        for i in range(min(len(arr), len(o["t"])) - 1, -1, -1):
+            if arr[i] is not None:
+                return arr[i], o["t"][i]
+        return None, None
+
+    def over(name, fn):
+        v = valid([_col(o, name, i) for i in idx])
+        return fn(v) if v else None
+
+    T, tT = last("tre200h0")
+    fo = over("wcc006h0", sum)
+    return {"T": T, "tT": tT, "tmin": over("tre200hn", min) if o.get("tre200hn") else over("tre200h0", min),
+            "tmax": over("tre200hx", max) if o.get("tre200hx") else over("tre200h0", max),
+            "prec": over("rre150h0", sum), "sd": last("htoauths")[0], "gust": over("fu3010h1", max),
+            "foehn_h": fo / 60 if fo is not None else None, "n": len(idx)}
+
+
+def verify(O):
+    """Vorlauf 1–3 Tage: Tageswerte der früheren Läufe gegen Messungen (UTC-Tage)."""
+    if not O.get("prev"):
+        return None
+    today = dt.datetime.now(dt.timezone.utc).date()
+    R = {L: {"tx": [], "tn": [], "pr": []} for L in (1, 2, 3)}
+    for s in O["stations"]:
+        a = s["abbr"]
+        rec, obs = O["prev"].get(a), O["recent"].get(a)
+        if not rec or not obs:
+            continue
+        od = {t.date(): i for i, t in enumerate(obs["t"])}
+        for d, ii in rec["idx"].items():
+            if d >= today or d not in od:
+                continue
+            j = od[d]
+            otx, otn, opr = _col(obs, "tre200dx", j), _col(obs, "tre200dn", j), _col(obs, "rka150d0", j)
+            for L in (1, 2, 3):
+                arr = rec["v"].get(f"temperature_2m_previous_day{L}") or []
+                T = valid([arr[i] for i in ii if i < len(arr)])
+                if len(T) >= 20:
+                    if otx is not None:
+                        R[L]["tx"].append((max(T) - otx, s["elev"]))
+                    if otn is not None:
+                        R[L]["tn"].append((min(T) - otn, s["elev"]))
+                parr = rec["v"].get(f"precipitation_previous_day{L}") or []
+                hrs = [dt.datetime(d.year, d.month, d.day) + dt.timedelta(hours=h) for h in range(1, 25)]
+                pv = [parr[rec["tidx"][t]] if t in rec["tidx"] and rec["tidx"][t] < len(parr) else None for t in hrs]
+                if opr is not None and len(valid(pv)) >= 20:
+                    R[L]["pr"].append((sum(valid(pv)), opr))
+    out = {}
+    for L, r in R.items():
+        def es(lst):
+            e = [x[0] for x in lst]
+            return {"bias": sum(e) / len(e), "mae": sum(abs(x) for x in e) / len(e), "n": len(e)} if e else None
+        hits = sum(1 for f, o in r["pr"] if f >= 1 and o >= 1)
+        miss = sum(1 for f, o in r["pr"] if f < 1 and o >= 1)
+        fa = sum(1 for f, o in r["pr"] if f >= 1 and o < 1)
+        out[L] = {"tx": es(r["tx"]), "tn": es(r["tn"]), "n_pr": len(r["pr"]),
+                  "pod": hits / (hits + miss) if hits + miss else None,
+                  "far": fa / (hits + fa) if hits + fa else None,
+                  "tn_low": es([x for x in r["tn"] if x[1] < 1200]),
+                  "tn_high": es([x for x in r["tn"] if x[1] >= 2000])}
+    # Nowcast: aktueller Lauf heute gegen stündliche Messungen
+    errs = []
+    for s in O["stations"]:
+        rec, obs = O["prev"].get(s["abbr"]), O["now"].get(s["abbr"])
+        if not rec or not obs:
+            continue
+        arr = rec["v"].get("temperature_2m") or []
+        for t, v in zip(obs["t"], obs.get("tre200h0") or []):
+            i = rec["tidx"].get(t)
+            if v is not None and t.date() == today and i is not None and i < len(arr) and arr[i] is not None:
+                errs.append(arr[i] - v)
+    out["now"] = {"bias": sum(errs) / len(errs), "mae": sum(abs(e) for e in errs) / len(errs),
+                  "n": len(errs)} if errs else None
+    return out
+
+
+def consistency(rec, days):
+    out = {}
+    for d in days[:5]:
+        ii = rec["idx"].get(d, [])
+        row = {}
+        for L in (0, 1, 2, 3):
+            vt = "temperature_2m" if L == 0 else f"temperature_2m_previous_day{L}"
+            vp = "precipitation" if L == 0 else f"precipitation_previous_day{L}"
+            T = valid([(rec["v"].get(vt) or [None] * len(rec["t"]))[i] for i in ii])
+            P = valid([(rec["v"].get(vp) or [None] * len(rec["t"]))[i] for i in ii])
+            if len(T) >= 20:
+                row[L] = (max(T), sum(P) if len(P) >= 20 else None)
+        if row:
+            out[d] = row
+    return out
+
+
+def find_bulletin(obj, region=SLF_REGION, depth=0):
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        regs = obj.get("regions")
+        if isinstance(regs, list):
+            for r in regs:
+                rid = str((r or {}).get("regionID") or (r or {}).get("id") or "") if isinstance(r, dict) else str(r)
+                if rid.endswith(region) and ("CH" in rid or rid == region):
+                    return obj
+        for v in obj.values():
+            b = find_bulletin(v, region, depth + 1)
+            if b:
+                return b
+    elif isinstance(obj, list):
+        for v in obj:
+            b = find_bulletin(v, region, depth + 1)
+            if b:
+                return b
+    return None
+
+
+def collect_slf():
+    print("Lade Lawinenbulletin SLF …", file=sys.stderr)
+    reached = False
+    for url in SLF_URLS:
+        try:
+            data = json.loads(fetch_bytes(url, timeout=30).decode("utf-8"))
+        except (ApiError, ValueError, UnicodeDecodeError):
+            continue
+        reached = True
+        b = find_bulletin(data)
+        if b:
+            return {"status": "ok", "bulletin": b}
+    return {"status": "keins" if reached else "fehler"}
+
+
+def elev_text(e):
+    if not isinstance(e, dict):
+        return ""
+    f = lambda x: "der Waldgrenze" if str(x) == "treeline" else f"{x} m"
+    lo, hi = e.get("lowerBound"), e.get("upperBound")
+    if lo and hi:
+        return f"zwischen {f(lo)} und {f(hi)}"
+    return f"oberhalb {f(lo)}" if lo else (f"unterhalb {f(hi)}" if hi else "")
+
+
+def slf_text(S):
+    if not S or S["status"] == "fehler":
+        return "Das Lawinenbulletin des SLF war bei der Erstellung nicht abrufbar; aktuell auf slf.ch."
+    if S["status"] == "keins":
+        return ("Für die SLF-Warnregion Riederalp (4214) liegt derzeit kein Lawinenbulletin vor. Das SLF publiziert "
+                "das tägliche Bulletin in der Regel ab dem ersten bedeutenden Schneefall im Herbst bis in den Frühling.")
+    b = S["bulletin"]
+    rat = []
+    for r in b.get("dangerRatings") or []:
+        lv = DANGER.get(r.get("mainValue"))
+        if lv:
+            rat.append((lv, elev_text(r.get("elevation")), r.get("validTimePeriod")))
+    if not rat:
+        return "Lawinenbulletin für die Region Riederalp (4214) vorhanden, aber ohne Gefahrenstufe (z. B. kein Schnee)."
+    top = max(rat, key=lambda x: x[0][0])
+    t = f"Lawinengefahr in der SLF-Warnregion Riederalp (4214): Stufe {top[0][0]}, {top[0][1]}"
+    t += f" {top[1]}." if top[1] else "."
+    others = [f"Stufe {lv[0]} {el}".strip() for lv, el, _ in rat if (lv, el) != (top[0], top[1])]
+    if others:
+        t += " Daneben " + join_de(others) + "."
+    pr = []
+    for p in b.get("avalancheProblems") or []:
+        nm = PROBLEMS.get(p.get("problemType"), p.get("problemType"))
+        asp = p.get("aspects") or []
+        bits = [x for x in (elev_text(p.get("elevation")), "Expositionen " + ", ".join(asp) if asp else "") if x]
+        pr.append(nm + (f" ({'; '.join(bits)})" if bits else ""))
+    if pr:
+        t += " Lawinenprobleme: " + "; ".join(pr) + "."
+    vt = (b.get("validTime") or {}).get("endTime")
+    if vt:
+        try:
+            e = dt.datetime.fromisoformat(str(vt).replace("Z", "+00:00")).astimezone(TZ)
+            t += f" Gültig bis {dlong(e.date())}, {e:%H:%M} Uhr."
+        except ValueError:
+            pass
+    return t + " Quelle: SLF (slf.ch)."
+
+
+def slf_level(S):
+    if not S or S.get("status") != "ok":
+        return None
+    lv = [DANGER[r.get("mainValue")][0] for r in (S["bulletin"].get("dangerRatings") or []) if r.get("mainValue") in DANGER]
+    return max(lv) if lv else None
+
+
+def archive_months(cache_dir, fname, table, keys, daily_vars, months, cands, tz="GMT"):
+    path = os.path.join(cache_dir, fname)
+    cache = {"model": None, "months": {}}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    for mth in months:
+        if str(mth) in cache["months"]:
+            continue
+        print(f"  {fname}: Monat {mth}, 30 Jahre (einmalig) …", file=sys.stderr)
+        block = {k: {"date": [], **{v: [] for v in daily_vars}} for k in keys}
+        ok = True
+        for y in range(1991, 2021):
+            last = calendar.monthrange(y, mth)[1]
+            params = {**coords(keys, table, elev=False), "start_date": f"{y}-{mth:02d}-01",
+                      "end_date": f"{y}-{mth:02d}-{last:02d}", "timezone": tz, "daily": ",".join(daily_vars)}
+            data, err = None, None
+            for c in ([cache["model"]] if cache.get("model") is not None else cands):
+                p = dict(params)
+                if c:
+                    p["models"] = c
+                try:
+                    rate_budget(len(keys) * 3)
+                    data = fetch_json(API_ARCH, p)
+                    cache["model"] = c
+                    break
+                except ApiError as e:
+                    err = e
+            if data is None:
+                log(f"{fname} Monat {mth} ({err})")
+                ok = False
+                break
+            for k, it in zip(keys, data if isinstance(data, list) else [data]):
+                dd = it.get("daily") or {}
+                block[k]["date"] += dd.get("time", [])
+                for v in daily_vars:
+                    block[k][v] += dd.get(v, [None] * len(dd.get("time", [])))
+            time.sleep(PAUSE)
+        if ok:
+            cache["months"][str(mth)] = block
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+    return cache
+
+
+def window_vals(cache, loc, d, var, half=7):
+    target = dt.date(2001, d.month, 28 if (d.month == 2 and d.day == 29) else d.day).timetuple().tm_yday
+    out = []
+    for block in cache.get("months", {}).values():
+        b = block.get(loc)
+        if not b:
+            continue
+        for ds, x in zip(b["date"], b.get(var, [])):
+            if x is None:
+                continue
+            dd = dt.date.fromisoformat(ds)
+            if dd.month == 2 and dd.day == 29:
+                continue
+            dist = abs(dt.date(2001, dd.month, dd.day).timetuple().tm_yday - target)
+            if min(dist, 365 - dist) <= half:
+                out.append(x)
+    return out
+
+
+def nao_proxy(D, X, cache):
+    """Stationsbasierter NAO-Index (Hurrell-Art): standardisierte Bodendruckanomalie Lissabon minus Reykjavík."""
+    up = D.get("up") or {}
+    L, R = up.get("c_lissabon"), up.get("c_reykjavik")
+    if not L or not R or not cache:
+        return {}
+    out = {}
+    for d in X["days"]:
+        vals = []
+        for rec, k in ((L, "lis"), (R, "rey")):
+            ii = rec["idx"].get(d, [])
+            p = valid([(rec["v"].get("pressure_msl") or [None] * len(rec["t"]))[i] for i in ii])
+            cl = window_vals(cache, k, d, "pressure_msl_mean")
+            if len(p) < 20 or len(cl) < 100:
+                break
+            mu = sum(cl) / len(cl)
+            sd = math.sqrt(sum((x - mu) ** 2 for x in cl) / (len(cl) - 1))
+            vals.append((sum(p) / len(p) - mu) / sd)
+        if len(vals) == 2:
+            out[d] = vals[0] - vals[1]
+    return out
+
+
+def week_trend(rec, clim, X):
+    """ECMWF ENS bis 15 Tage: Wochenmittel des Höchstwerts und Wochensumme Niederschlag gegen 1991–2020."""
+    today = X["days"][0]
+    weeks = [("Woche 1", [today + dt.timedelta(k) for k in range(1, 8)]),
+             ("Woche 2", [today + dt.timedelta(k) for k in range(8, 15)])]
+    index_days(rec, [today + dt.timedelta(k) for k in range(16)])
+    T, P = members(rec, "temperature_2m"), members(rec, "precipitation")
+    out = []
+    for lab, wd in weeks:
+        cx = [window_vals(clim, "riederalp", d, "tmax") for d in wd]
+        cp = [window_vals(clim, "riederalp", d, "prec") for d in wd]
+        if any(len(c) < 100 for c in cx):
+            continue
+        clim_tx = sum(sum(c) / len(c) for c in cx) / len(wd)
+        clim_pr = sum(sum(c) / len(c) for c in cp) if all(cp) else None
+        an, pr = [], []
+        for m in range(len(T)):
+            txs = []
+            for d in wd:
+                v = valid([T[m][i] for i in rec["idx"].get(d, []) if i < len(T[m])])
+                if len(v) < 20:
+                    break
+                txs.append(max(v))
+            if len(txs) == len(wd):
+                an.append(sum(txs) / len(txs) - clim_tx)
+                if m < len(P):
+                    pv = valid([P[m][i] for d in wd for i in rec["idx"].get(d, []) if i < len(P[m])])
+                    pr.append(sum(pv))
+        if len(an) < 10:
+            continue
+        out.append({"label": lab, "from": wd[0], "to": wd[-1], "an": qstats(an), "p_warm": frac(an, 0.0),
+                    "p_w2": frac(an, 2.0), "p_c2": sum(1 for a in an if a <= -2) / len(an),
+                    "clim_tx": clim_tx, "clim_pr": clim_pr, "pr": qstats(pr),
+                    "p_wet": (sum(1 for x in pr if x > clim_pr) / len(pr)) if (pr and clim_pr) else None,
+                    "n": len(an)})
+    return out
+
+
 # ================================================================ Karten
 NE_BASE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
 NE_LAYERS = [("coast", "ne_50m_coastline", ("europa",)),
@@ -2250,8 +3003,8 @@ def fetch_bytes(url, timeout=60):
 
 
 # ---------------------------------------------------------------- PNG
-def png_encode(w, h, rows, ct):
-    """rows: Bytezeilen ohne Filterbyte; ct 4 = Grau+Alpha, 6 = RGBA. Filter 'Up'."""
+def png_encode(w, h, rows, ct, palette=None):
+    """rows: Bytezeilen ohne Filterbyte; ct 2 = RGB, 3 = Palette, 4 = Grau+Alpha, 6 = RGBA. Filter 'Up'."""
     out, prev = bytearray(), bytes(len(rows[0]))
     for r in rows:
         out.append(2)
@@ -2261,12 +3014,13 @@ def png_encode(w, h, rows, ct):
     def chunk(t, d):
         return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
 
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ct, 0, 0, 0))
+    plte = chunk(b"PLTE", b"".join(bytes(c) for c in palette)) if palette else b""
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ct, 0, 0, 0)) + plte
             + chunk(b"IDAT", zlib.compress(bytes(out), 9)) + chunk(b"IEND", b""))
 
 
-def png_uri(w, h, rows, ct):
-    return "data:image/png;base64," + base64.b64encode(png_encode(w, h, rows, ct)).decode()
+def png_uri(w, h, rows, ct, palette=None):
+    return "data:image/png;base64," + base64.b64encode(png_encode(w, h, rows, ct, palette)).decode()
 
 
 def png_decode(data):
@@ -2484,45 +3238,39 @@ def relief_uri(dem, P, vex):
     dy = (P.la1 - P.la0) / H * 110574
     az, alt = math.radians(315), math.radians(45)
     Lx, Ly, Lz = math.sin(az) * math.cos(alt), math.cos(az) * math.cos(alt), math.sin(alt)
+    BAYER = [[(v + 0.5) / 16 for v in row] for row in ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))]
+    # Palettenbild: 32 Höhenstufen à 150 m × 8 Schattierungsstufen = 256 Farben, 1 Byte pro Pixel
+    NB, NS = 32, 8
+    shades = [0.5 + 0.72 * k / (NS - 1) for k in range(NS)]
+    pal = []
+    for band in range(NB):
+        zz = band * 150 + 75
+        c = TINT_STOPS[0][1] if zz <= TINT_STOPS[0][0] else TINT_STOPS[-1][1]
+        for (a_, ca), (b_, cb) in zip(TINT_STOPS, TINT_STOPS[1:]):
+            if a_ <= zz <= b_:
+                t = (zz - a_) / (b_ - a_)
+                c = tuple(x + (y - x) * t for x, y in zip(ca, cb))
+                break
+        pal += [tuple(min(255, int(x * f)) for x in c) for f in shades]
     rows = []
     for j in range(H):
         jm, jp = max(j - 1, 0), min(j + 1, H - 1)
-        r = bytearray(2 * W)
+        r = bytearray(W)
         for i in range(W):
             im, ip = max(i - 1, 0), min(i + 1, W - 1)
             gx = (dem[j][ip] - dem[j][im]) / ((ip - im) * dx) * vex
             gy = (dem[jm][i] - dem[jp][i]) / ((jp - jm) * dy) * vex
-            dv = (-gx * Lx - gy * Ly + Lz) / math.sqrt(gx * gx + gy * gy + 1) - Lz
-            if dv < 0:
-                r[2 * i], r[2 * i + 1] = 0, min(200, int(-dv * 300))
-            else:
-                r[2 * i], r[2 * i + 1] = 255, min(200, int(dv * 240))
+            sh = (-gx * Lx - gy * Ly + Lz) / math.sqrt(gx * gx + gy * gy + 1)
+            bfac = min(1.22, max(0.5, 1.0 + 1.15 * (sh - Lz)))
+            band = min(NB - 1, max(0, int(dem[j][i] // 150)))
+            lev = (bfac - 0.5) / 0.72 * (NS - 1) + BAYER[j & 3][i & 3]
+            r[i] = band * NS + min(NS - 1, max(0, int(lev)))
         rows.append(bytes(r))
-    return png_uri(W, H, rows, 4)
+    return png_uri(W, H, rows, 3, pal)
 
 
 TINT_STOPS = [(200, (178, 198, 160)), (900, (192, 204, 165)), (1600, (214, 204, 168)), (2300, (206, 186, 158)),
               (3000, (178, 168, 160)), (4200, (160, 160, 168))]
-
-
-def tint_uri(dem, P):
-    rows = []
-    for j in range(P.H):
-        r = bytearray(4 * P.W)
-        for i, z in enumerate(dem[j]):
-            if z <= TINT_STOPS[0][0]:
-                c = TINT_STOPS[0][1]
-            elif z >= TINT_STOPS[-1][0]:
-                c = TINT_STOPS[-1][1]
-            else:
-                for (a, ca), (b, cb) in zip(TINT_STOPS, TINT_STOPS[1:]):
-                    if a <= z <= b:
-                        t = (z - a) / (b - a)
-                        c = tuple(int(x + (y - x) * t) for x, y in zip(ca, cb))
-                        break
-            r[4 * i:4 * i + 4] = bytes((*c, 150))
-        rows.append(bytes(r))
-    return png_uri(P.W, P.H, rows, 6)
 
 
 def snow_uri(dem, P, level):
@@ -2744,8 +3492,6 @@ def scale_bar(P):
 def base_layer(P, geo, name, dem, vex):
     h = [svg_open(P, "base")]
     if dem:
-        h.append(f'<image href="{tint_uri(dem, P)}" x="0" y="0" width="{P.W}" height="{P.H}" '
-                 'preserveAspectRatio="none" class="tint"/>')
         h.append(f'<image href="{relief_uri(dem, P, vex)}" x="0" y="0" width="{P.W}" height="{P.H}" '
                  'preserveAspectRatio="none" class="relief"/>')
     g = geo.get(name, {}) if geo else {}
@@ -3144,7 +3890,7 @@ svg .elev1{stroke:var(--ink);stroke-width:1.2;stroke-dasharray:3 3}
 .tw{overflow-x:auto;margin:.8rem 0 1.2rem;-webkit-overflow-scrolling:touch}
 table{border-collapse:collapse;font-size:.95rem;min-width:100%}
 th,td{text-align:left;padding:.35rem .6rem;border-bottom:1px solid var(--rule);vertical-align:top;white-space:nowrap}
-td:nth-child(2){white-space:normal;min-width:9rem}
+td:first-child,td:nth-child(2){white-space:normal;min-width:5.5rem}
 th{font-weight:600;color:var(--muted)}
 .meta{color:var(--muted);font-size:1.05rem;margin:0}
 .narr{border-left:3px solid var(--contour);padding:.2rem 0 .2rem 1rem;margin:1rem 0}
@@ -3169,8 +3915,8 @@ svg.maplayer{width:100%;height:100%;display:block}
 .mapw>input:nth-of-type(9):checked~.stack .panes>div:nth-child(9){display:block}
 .mapw>input:nth-of-type(10):checked~.stack .panes>div:nth-child(10){display:block}
 svg .lake{fill:var(--water)}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) svg .tint{opacity:.45}}
-:root[data-theme="dark"] svg .tint{opacity:.45}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) svg .relief{filter:brightness(.6) saturate(.8)}}
+:root[data-theme="dark"] svg .relief{filter:brightness(.6) saturate(.8)}
 svg .river{fill:none;stroke:var(--water2);stroke-width:1.1}
 svg .border{fill:none;stroke:var(--ink);stroke-width:.8;stroke-dasharray:4 2;opacity:.5}
 svg .sbar{stroke:var(--ink);stroke-width:2}
@@ -3220,7 +3966,7 @@ def render_html(md, charts, X):
 <body>
 <main>
 {body}
-<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
+<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Messwerte: Quelle MeteoSchweiz. Lawinenbulletin: SLF (slf.ch). Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
 </main>
 </body>
 </html>"""
@@ -3285,6 +4031,7 @@ def main():
         print("Keine Primärdaten erhalten – Abbruch.", file=sys.stderr)
         sys.exit(1)
     X = diagnose(D, days, now)
+    diagnose_extra(D, X)
     md = build_report(X)
     narr = claude_narrative(X, md) if args.claude else None
     if narr:
