@@ -48,7 +48,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.4"
+VERSION = "1.5"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -300,6 +300,9 @@ def fetch_model(api, label, candidates, params, keys, days, factor=1.0, parser=N
     last = None
     nvars = len((params.get("hourly") or params.get("daily") or "x").split(","))
     weight = len(keys) * max(1, math.ceil(nvars / 10)) * max(1, math.ceil(params.get("forecast_days", 7) / 14)) * factor
+    known = MODEL_IDS.get(label)
+    if known in candidates:
+        candidates = [known] + [c for c in candidates if c != known]
     for mid in candidates:
         p = dict(params)
         if mid:
@@ -311,11 +314,14 @@ def fetch_model(api, label, candidates, params, keys, days, factor=1.0, parser=N
             parsed = (parser or parse_hourly)(data, keys, days)
             if not any(valid(arr) for rec in parsed.values() for arr in rec["v"].values()):
                 raise ApiError("nur leere Werte")
+            MODEL_IDS[label] = mid
+            status(label, True, mid or "Standard")
             return mid, parsed
         except ApiError as e:
             last = e
             time.sleep(PAUSE)
     log(f"{label} ({last})")
+    status(label, False, last)
     return None, None
 
 
@@ -389,11 +395,13 @@ def collect(days, cache_dir):
 
     print("Lade CAMS-Aerosol …", file=sys.stderr)
     try:
-        aqp = {**coords(["riederalp"], LOCAL, elev=False), "hourly": "dust,aerosol_optical_depth",
+        aqp = {**coords(["riederalp"], LOCAL, elev=False), "hourly": "dust,aerosol_optical_depth,european_aqi," + ",".join(POLLEN),
                "timezone": TZNAME, "forecast_days": min(5, nd)}
         D["aq"] = parse_hourly(fetch_json(API_AQ, aqp), ["riederalp"], days)
+        status("CAMS Aerosol, Luftqualität, Pollen", True)
     except ApiError as e:
         log(f"CAMS-Aerosol ({e})")
+        status("CAMS Aerosol, Luftqualität, Pollen", False, e)
 
     print("Lade UV und Sonnenzeiten …", file=sys.stderr)
     _m, D["sun"] = fetch_model(API_FC, "UV und Sonnenzeiten", ["best_match"],
@@ -417,6 +425,8 @@ def collect(days, cache_dir):
     D["slf"] = collect_slf()
     D["welt"] = collect_world()
     D["swiss_now"] = collect_swiss_now(cache_dir)
+    D["mch"] = collect_mch(cache_dir)
+    collect_rivers_aletsch(D, days, cache_dir)
 
     print("Klimatologie ERA5-Land …", file=sys.stderr)
     D["clim"] = clim_fetch(cache_dir, d15)
@@ -1062,6 +1072,20 @@ def diagnose_extra(D, X):
     Wd = D.get("welt") or {}
     X["world_raw"], X["peaks"], X["gdacs"], X["enso"] = Wd.get("world"), Wd.get("peaks"), Wd.get("gdacs"), Wd.get("enso")
     X["swiss_now"] = D.get("swiss_now") or []
+    X["mch"] = D.get("mch")
+    X["rivers"] = river_diag(D, X)
+    X["aletsch"] = aletsch_diag(D, X)
+    X["records"] = {d: day_records(D.get("clim"), "riederalp", d) for d in X["days"][:2]}
+    X["moon"] = moon(X["days"][0])
+    X["air"] = {}
+    aq = (D.get("aq") or {}).get("riederalp")
+    if aq:
+        for d in X["days"]:
+            ii = aq["idx"].get(d, [])
+            col = lambda k: valid([(aq["v"].get(k) or [None] * len(aq["t"]))[i] for i in ii])
+            aqi = col("european_aqi")
+            X["air"][d] = {"aqi": max(aqi) if aqi else None,
+                           "pollen": {k: (max(col(k)) if col(k) else None) for k in POLLEN}}
     X["sun"] = {}
     sr = (D.get("sun") or {}).get("riederalp")
     if sr:
@@ -1305,14 +1329,14 @@ def build_report(X):
     if runs:
         A(f"Modellläufe: {join_de(runs)}.")
         A("")
-    out.extend(glance(X))
+    out.extend(safe_lines(glance, X))
     A("<!--CHART:profil-->")
     A("")
 
     # ---------- Kernaussagen
     A("## Kernaussagen")
     A("")
-    for txt in insights(X):
+    for txt in safe_lines(insights, X):
         A(f"- {txt}")
     A("")
     A("<!--NARRATIV-->")
@@ -1369,6 +1393,7 @@ def build_report(X):
                 if sn["uv"] >= 3 and (s.get("sd_end") or 0) >= 5:
                     t += "; Schnee reflektiert zusätzlich bis zu 80 % der UV-Strahlung"
             parts.append(t + ".")
+        parts.append(air_text(X, d))
         cf = X["conf"].get(d)
         if cf:
             parts.append(f"Prognosesicherheit {cf['label']}.")
@@ -1378,7 +1403,7 @@ def build_report(X):
         A("")
     A("<!--CHART:karte_ried-->")
     A("")
-    out.extend(obs_section(X))
+    out.extend(safe_lines(obs_section, X))
     if len(days) > 2:
         A("### Folgetage")
         A("")
@@ -1413,6 +1438,8 @@ def build_report(X):
         A("")
     A("<!--CHART:schnee-->")
     A("")
+    out.extend(safe_lines(aletsch_section, X))
+    A("")
     A("<!--CHART:fan-->")
     A("")
 
@@ -1432,7 +1459,7 @@ def build_report(X):
         for d in days[2:]:
             A(f"- **{dshort(d)}** {wallis_short(X, d)}")
         A("")
-    out.extend(snow_table(X))
+    out.extend(safe_lines(snow_table, X))
 
     # ---------- Schweiz
     A("## Schweiz")
@@ -1451,6 +1478,7 @@ def build_report(X):
         for d in days[2:]:
             A(f"- **{dshort(d)}** {swiss_short(X, d)}")
         A("")
+    out.extend(safe_lines(river_section, X))
 
     # ---------- Europa
     A("## Europa")
@@ -1491,23 +1519,24 @@ def build_report(X):
         A("")
 
     # ---------- Welt und Fun Facts
-    out.extend(world_section(X))
-    out.extend(fun_section(X))
+    out.extend(safe_lines(world_section, X, title="Welt"))
+    out.extend(safe_lines(fun_section, X, title="Fun Facts"))
 
     # ---------- Unsicherheiten
     A("## Unsicherheiten und Modellvergleich")
     A("")
-    out.extend(uncertainty_section(X))
+    out.extend(safe_lines(mch_section, X))
+    out.extend(safe_lines(uncertainty_section, X))
 
     # ---------- Klima
     A("## Klimatologische Einordnung")
     A("")
-    out.extend(clim_section(X))
+    out.extend(safe_lines(clim_section, X))
 
     # ---------- Methodik
     A("## Methodik und Quellen")
     A("")
-    out.extend(method_section(X))
+    out.extend(safe_lines(method_section, X))
     return "\n".join(out)
 
 
@@ -1534,7 +1563,12 @@ def glance(X):
         + f" / {hm(s['fzl_mean'])}")
     row("Böen", lambda s, d: f"{n(s['gust'])} km/h" if s.get("gust") is not None else "–")
     row("Sicherheit", lambda s, d: X["conf"].get(d, {}).get("label", "–"))
-    return rows + ["", "Niederschlag mit Ensemble-Wahrscheinlichkeit für mindestens 1 mm.", ""]
+    M = ((X.get("mch") or {}).get("data") or {}).get("riederalp") or {}
+    if M.get("tre200px"):
+        row("MeteoSchweiz", lambda s, d: (f"{picto(M.get('jp2000d0', {}).get(d))}, {n(M.get('tre200pn', {}).get(d))} / "
+                                          f"{n(M['tre200px'].get(d))} °C") if d in M["tre200px"] else "–")
+    return rows + ["", "Niederschlag mit Ensemble-Wahrscheinlichkeit für mindestens 1 mm. Letzte Zeile: offizielle "
+                   "Lokalprognose von MeteoSchweiz zum Vergleich.", ""]
 
 
 def obs_section(X):
@@ -2129,6 +2163,19 @@ def insights(X):
         if w["label"] == "Woche 2" and w["p_warm"] is not None and (w["p_warm"] >= 0.8 or w["p_warm"] <= 0.2):
             I.append((5, f"Tendenz {dshort(w['from'])} bis {dshort(w['to'])}: mit {pct(max(w['p_warm'], 1 - w['p_warm']))} "
                          f"{'wärmer' if w['p_warm'] >= 0.5 else 'kälter'} als 1991–2020 (Median {sgn(w['an']['p50'])} K)."))
+    M = ((X.get("mch") or {}).get("data") or {}).get("riederalp") or {}
+    for d in days[:2]:
+        s = LD["riederalp"].get(d)
+        mx = (M.get("tre200px") or {}).get(d)
+        if s and mx is not None and abs(s["tmax"] - mx) >= 3:
+            I.append((4, f"{'Heute' if d == days[0] else 'Morgen'} weicht der Höchstwert für die Riederalp um "
+                         f"{sgn(s['tmax'] - mx)} K von der MeteoSchweiz-Lokalprognose ({deg(mx)}) ab."))
+            break
+    for r in X.get("rivers") or []:
+        if r.get("clim_max") and r.get("pk_max") and r["pk_max"][2] and r["pk_max"][2] > r["clim_max"]:
+            I.append((6, f"Abfluss {r['name']}: einzelne Ensemble-Member übersteigen bis {dshort(r['pk_max'][0])} den "
+                         f"höchsten Wert dieser Jahreszeit 1991–2020 (GloFAS)."))
+            break
     big = [e for e in (X.get("gdacs") or []) if e["alert"] in ("Red", "Orange")]
     if big:
         e = big[0]
@@ -2265,7 +2312,17 @@ def clim_section(X):
       "ungefähr einem normalen Tag. Prognose und Reanalyse sind nicht gegeneinander biaskorrigiert, "
       "in steilem Gelände sind ±1–2 K Unsicherheit in der Anomalie realistisch.")
     A("")
-    out.extend(week_section(X))
+    rc = (X.get("records") or {}).get(days[0])
+    if rc:
+        t = (f"Dieser Kalendertag auf der Riederalp 1991–2020 (ERA5-Land): höchster Höchstwert {deg(rc['hot'][0], 1)} "
+             f"({rc['hot'][1]}), tiefster Tiefstwert {deg(rc['cold'][0], 1)} ({rc['cold'][1]}), nassester Tag "
+             f"{n(rc['wet'][0], 1)} mm ({rc['wet'][1]}).")
+        s0 = X["local"]["riederalp"].get(days[0])
+        if s0 and s0["tmax"] > rc["hot"][0]:
+            t += f" Der heutige Höchstwert von {deg(s0['tmax'])} läge über dem Wert dieser 30 Jahre."
+        A(t)
+        A("")
+    out.extend(safe_lines(week_section, X))
     return out
 
 
@@ -2315,6 +2372,13 @@ def method_section(X):
       "nur aktive Ereignisse. ENSO: wöchentliche relative Niño-3.4-Anomalie von NOAA CPC. Schweizweite Messwerte: "
       "aktuelle 10-Minuten-Werte aller SwissMetNet-Stationen (MeteoSchweiz).")
     A("")
+    A("**MeteoSchweiz-Vergleich:** offizielle Lokalprognose (Open Data, Quelle: MeteoSchweiz) für den Postleitzahlpunkt "
+      "Riederalp 3987 und Messstationen, Tageswerte in Lokalzeit; Wettertexte nach dem Piktogrammverzeichnis von "
+      "MeteoSchweiz. **Abfluss:** GloFAS (Copernicus Emergency Management Service) über Open-Meteo, Klimatologie aus der "
+      "GloFAS-Reanalyse 1991–2020. **Aletsch:** Temperatur auf drei Höhenstufen (statistisch skaliert), Gradtagmodell. "
+      "**Luft und Pollen:** CAMS Europa. **Mond:** Rechnung mit mittlerem synodischem Monat, Genauigkeit etwa ±1 Tag.")
+    A("")
+    out.extend(status_table())
     A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
     A("")
@@ -2639,6 +2703,7 @@ def collect_obs(cache_dir):
         st = smn_stations(cache_dir)
     except (ApiError, OSError) as e:
         log(f"MeteoSchweiz-Stationsliste ({e})")
+        status("MeteoSchweiz-Messwerte", False, e)
         return O
     R = LOCAL["riederalp"]
     near = sorted(({**s, "km": km(R["lat"], R["lon"], s["lat"], s["lon"])} for s in st), key=lambda s: s["km"])
@@ -2651,11 +2716,14 @@ def collect_obs(cache_dir):
         except (ApiError, ValueError) as e:
             return t, None, e
 
+    nok = 0
     for (a, gran, upd), res, err in pmap(get, tasks, workers=6):
         if res is not None:
             O["now" if upd == "now" else "recent"][a] = res
+            nok += 1
         else:
             log(f"MeteoSchweiz {a} {gran}_{upd} ({err})")
+    status("MeteoSchweiz-Messwerte", nok > 0, f"{nok} von {len(tasks)} Dateien")
     if O["stations"]:
         print("Lade frühere Modellläufe für die Verifikation …", file=sys.stderr)
         tab = {s["abbr"]: _p(s["name"], s["lat"], s["lon"], int(round(s["elev"]))) for s in O["stations"]}
@@ -2810,7 +2878,9 @@ def collect_slf():
         reached = True
         b = find_bulletin(data)
         if b:
+            status("SLF-Lawinenbulletin", True, "Region 4214")
             return {"status": "ok", "bulletin": b}
+    status("SLF-Lawinenbulletin", reached, "kein Bulletin für 4214" if reached else "nicht erreichbar")
     return {"status": "keins" if reached else "fehler"}
 
 
@@ -2869,7 +2939,7 @@ def slf_level(S):
     return max(lv) if lv else None
 
 
-def archive_months(cache_dir, fname, table, keys, daily_vars, months, cands, tz="GMT"):
+def archive_months(cache_dir, fname, table, keys, daily_vars, months, cands, tz="GMT", api=None):
     path = os.path.join(cache_dir, fname)
     cache = {"model": None, "months": {}}
     if os.path.exists(path):
@@ -2895,7 +2965,7 @@ def archive_months(cache_dir, fname, table, keys, daily_vars, months, cands, tz=
                     p["models"] = c
                 try:
                     rate_budget(len(keys) * 3)
-                    data = fetch_json(API_ARCH, p)
+                    data = fetch_json(api or API_ARCH, p)
                     cache["model"] = c
                     break
                 except ApiError as e:
@@ -3083,13 +3153,17 @@ def collect_world():
         url = (f"{API_GDACS}?eventlist=TC;FL;DR;WF&fromdate={t - dt.timedelta(14)}&todate={t}"
                "&alertlevel=green;orange;red")
         W["gdacs"] = parse_gdacs(json.loads(fetch_bytes(url, timeout=60).decode("utf-8")))
+        status("GDACS-Naturgefahren", True, f"{len(W['gdacs'])} aktive Ereignisse")
     except (ApiError, ValueError, UnicodeDecodeError) as e:
         log(f"GDACS ({e})")
+        status("GDACS-Naturgefahren", False, e)
     print("Lade ENSO-Index (NOAA CPC) …", file=sys.stderr)
     try:
         W["enso"] = parse_nino(fetch_bytes(CPC_NINO, timeout=30).decode("latin-1"))
+        status("NOAA ENSO-Index", True, f"Woche {W['enso'][-1][0]:%d.%m.}")
     except (ApiError, ValueError) as e:
         log(f"ENSO-Index ({e})")
+        status("NOAA ENSO-Index", False, e)
     return W
 
 
@@ -3139,6 +3213,7 @@ def collect_swiss_now(cache_dir):
         meta = {s["abbr"]: s for s in smn_stations(cache_dir)}
     except (ApiError, OSError) as e:
         log(f"Messwerte Schweiz ({e})")
+        status("MeteoSchweiz aktuelle Werte (alle Stationen)", False, e)
         return []
     lines = [ln for ln in text.splitlines() if ln.strip()]
     hi = next((i for i, ln in enumerate(lines) if "tre200s0" in ln), None)
@@ -3162,6 +3237,7 @@ def collect_swiss_now(cache_dir):
         out.append({"abbr": c[0], "name": m["name"], "elev": m["elev"], "T": f("tre200s0"),
                     "rain": f("rre150z0"), "rh": f("ure200s0"), "gust": f("fu3010z1"), "qff": f("pp0qffs0"),
                     "date": c[1] if len(c) > 1 else ""})
+    status("MeteoSchweiz aktuelle Werte (alle Stationen)", bool(out), f"{len(out)} Stationen")
     return out
 
 
@@ -3317,6 +3393,15 @@ def fun_facts(X):
         tx = (mb["v"].get("temperature_2m_max") or [None])[0]
         if tx is not None:
             eu.append(f"Gipfel des Mont Blanc (4806 m), höchster Punkt der Alpen: heute höchstens {deg(tx)}.")
+    mo = X.get("moon")
+    if mo:
+        eu.append(f"Mond heute Abend: {mo['name']}, zu {pct(mo['illum'])} beleuchtet; nächster Vollmond um den "
+                  f"{mo['full'].day}. {MONATE[mo['full'].month - 1]}.")
+    rc = (X.get("records") or {}).get(X["days"][0])
+    if rc:
+        y = X["days"][0].year - int(rc["cold"][1])
+        ch.append(f"Heute vor {y} Jahren ({rc['cold'][1]}) war dieser Kalendertag auf der Riederalp mit "
+                  f"{deg(rc['cold'][0], 1)} der kälteste der Jahre 1991–2020.")
     rows = world_rows(X)
     if rows:
         tx = [r_ for r_ in rows if r_["tmax"] is not None]
@@ -3444,6 +3529,412 @@ def push_ntfy(text):
             pass
     except (urllib.error.URLError, TimeoutError) as e:
         log(f"Push-Nachricht ({e})")
+
+
+# ================================================================ Ausbau: MeteoSchweiz, Abfluss, Aletsch, Mond
+MCH_LF = "ch.meteoschweiz.ogd-local-forecasting"
+MCH_ITEM = "https://data.geo.admin.ch/api/stac/v1/collections/" + MCH_LF + "/items/{}-ch"
+MCH_POINTS = "https://data.geo.admin.ch/" + MCH_LF + "/ogd-local-forecasting_meta_point.csv"
+MCH_DAILY = ("tre200px", "tre200pn", "rka150p0", "rreq10p0", "rreq90p0", "jp2000d0")
+MCH_SEL = {"riederalp": None, "sion": "SIO", "visp": "VIS", "zermatt": "ZER", "simplon": "SIM", "grimsel": "GRH",
+           "jungfraujoch": "JUN", "zuerich": "SMA", "bern": "BER", "basel": "BAS", "genf": "GVE", "lugano": "LUG",
+           "chur": "CHU"}
+PICTO = {1: "sonnig", 2: "ziemlich sonnig", 3: "teilweise sonnig", 4: "wechselnd bewölkt", 5: "bedeckt",
+         6: "Aufhellungen, einzelne Regenschauer", 7: "Aufhellungen, einzelne Regen- oder Schneeschauer",
+         8: "Aufhellungen, einzelne Schneeschauer", 9: "bewölkt, einige Regenschauer",
+         10: "bewölkt, einige Regen- oder Schneeschauer", 11: "bewölkt, einige Schneeschauer",
+         12: "Aufhellungen, leicht gewitterhaft", 13: "Aufhellungen und gewitterhaft",
+         14: "stark bewölkt, schwacher Regen", 15: "stark bewölkt, schwacher Schnee oder Regen",
+         16: "stark bewölkt, schwacher Schnee", 17: "stark bewölkt, zeitweise Regen",
+         18: "stark bewölkt, zeitweise Schnee oder Regen", 19: "stark bewölkt, zeitweise Schnee",
+         20: "stark bewölkt, anhaltender Regen", 21: "stark bewölkt, anhaltender Regen oder Schnee",
+         22: "stark bewölkt, anhaltender Schnee", 23: "stark bewölkt, leicht gewitterhaft",
+         24: "stark bewölkt, gewitterhaft", 25: "stark bewölkt, stark gewitterhaft", 26: "hohe Bewölkung",
+         27: "Hochnebel", 28: "Nebel", 29: "leicht bewölkt, einzelne Regenschauer",
+         30: "leicht bewölkt, leichter Schneefall", 31: "teilweise sonnig, einige Schnee- oder Regenschauer",
+         32: "teilweise sonnig, einige Regenschauer", 33: "bewölkt, häufige Regenschauer",
+         34: "bewölkt, häufige Schneeschauer", 35: "bedeckt und trocken", 36: "teilweise sonnig, gewitterhaft",
+         37: "teilweise sonnig, Gewitter und Schneeschauer", 38: "bewölkt, Gewitter und häufige Regenschauer",
+         39: "bewölkt, Gewitter und häufige Schneeschauer", 40: "stark bewölkt, leicht gewitterhaft",
+         41: "bewölkt, leicht gewitterhaft", 42: "stark bewölkt, Gewitter und häufige Schneeschauer"}
+API_FLOOD = "https://flood-api.open-meteo.com/v1/flood"
+RIVERS = {"rhone_sion": _p("Rhône bei Sion", 46.225, 7.355), "rhone_scex": _p("Rhône bei Porte du Scex", 46.349, 6.889),
+          "ticino": _p("Ticino bei Bellinzona", 46.190, 9.010)}
+ALETSCH = {f"a{z}": _p(f"Aletsch {z} m", 46.465, 8.010, z) for z in (2200, 2700, 3300)}
+STATUS = []          # (Quelle, ok, Hinweis)
+MODEL_IDS = {}       # funktionierende Open-Meteo-IDs aus früheren Läufen
+
+
+def status(name, ok, info=""):
+    STATUS.append((name, bool(ok), str(info)[:120]))
+
+
+def picto(code):
+    if code is None:
+        return "–"
+    c = int(code)
+    return PICTO.get(c - 100 if c > 100 else c, f"Symbol {c}")
+
+
+def mch_points(cache_dir):
+    path = os.path.join(cache_dir, "mch_punkte_v1.json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 30 * 86400:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    text = fetch_bytes(MCH_POINTS, timeout=60).decode("latin-1")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    head = [h.strip() for h in lines[0].split(";")]
+    ix = {k: head.index(k) for k in ("point_id", "point_type_id", "station_abbr", "postal_code", "point_name",
+                                      "point_height_masl") if k in head}
+    if len(ix) < 6:
+        raise ApiError("Punktliste in unbekanntem Format")
+    sel = {}
+    for ln in lines[1:]:
+        c = [x.strip() for x in ln.split(";")]
+        if len(c) < len(head):
+            continue
+        for key, abbr in MCH_SEL.items():
+            if key in sel:
+                continue
+            if abbr and c[ix["point_type_id"]] == "1" and c[ix["station_abbr"]] == abbr:
+                sel[key] = [c[ix["point_id"]], "1", c[ix["point_name"]], c[ix["point_height_masl"]]]
+            elif abbr is None and c[ix["point_type_id"]] == "2" and c[ix["postal_code"]] == "3987" \
+                    and "Riederalp" in c[ix["point_name"]]:
+                sel[key] = [c[ix["point_id"]], "2", c[ix["point_name"]], c[ix["point_height_masl"]]]
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sel, f)
+    return sel
+
+
+def collect_mch(cache_dir):
+    print("Lade MeteoSchweiz-Lokalprognose …", file=sys.stderr)
+    try:
+        sel = mch_points(cache_dir)
+        item = None
+        for back in (0, 1):
+            d = dt.datetime.now(TZ).date() - dt.timedelta(back)
+            try:
+                item = fetch_json(MCH_ITEM.format(d.strftime("%Y%m%d")), retries=2, quiet=True)
+                break
+            except ApiError:
+                continue
+        if not item:
+            raise ApiError("kein aktuelles STAC-Item")
+        assets = item.get("assets", {})
+        runs = sorted({k.split(".")[2] for k in assets if k.count(".") >= 4})
+        run = runs[-1]
+        hrefs = {p: next((a["href"] for k, a in assets.items() if k.split(".")[2] == run and k.split(".")[3] == p), None)
+                 for p in MCH_DAILY}
+        want = {(v[1], v[0]): k for k, v in sel.items()}
+        data = {k: {} for k in sel}
+
+        def load(p):
+            if not hrefs.get(p):
+                return p, None
+            return p, fetch_bytes(hrefs[p], timeout=60).decode("latin-1")
+
+        for p, text in pmap(load, MCH_DAILY, workers=6):
+            if not text:
+                continue
+            lines = text.splitlines()
+            head = [h.strip().strip('"') for h in lines[0].split(";")]
+            ip, it = head.index("point_id"), head.index("point_type_id")
+            itime = next(i for i, h in enumerate(head) if h.lower() in ("date", "time"))
+            iv = head.index(p) if p in head else len(head) - 1
+            for ln in lines[1:]:
+                c = [x.strip().strip('"') for x in ln.split(";")]
+                if len(c) < len(head):
+                    continue
+                key = want.get((c[it], c[ip]))
+                if not key or c[iv] in ("", "-"):
+                    continue
+                t = dt.datetime.strptime(c[itime][:12], "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc)
+                data[key].setdefault(p, {})[t.astimezone(TZ).date()] = float(c[iv])
+        rt = dt.datetime.strptime(run, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc).astimezone(TZ)
+        status("MeteoSchweiz-Lokalprognose", True, f"Lauf {rt:%d.%m. %H:%M} Uhr")
+        return {"run": dt.datetime.strptime(run, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc),
+                "points": sel, "data": data}
+    except (ApiError, ValueError, StopIteration, IndexError, KeyError, OSError) as e:
+        log(f"MeteoSchweiz-Lokalprognose ({e})")
+        status("MeteoSchweiz-Lokalprognose", False, e)
+        return None
+
+
+def collect_rivers_aletsch(D, days, cache_dir):
+    print("Lade Abfluss (GloFAS) und Aletsch-Höhenstufen …", file=sys.stderr)
+    keys = list(RIVERS)
+    _m, D["rivers"] = fetch_model(API_FLOOD, "Abflussprognose (GloFAS)", [""],
+                                  {**coords(keys, RIVERS, elev=False), "daily": "river_discharge,river_discharge_median,"
+                                   "river_discharge_p25,river_discharge_p75,river_discharge_max,river_discharge_min",
+                                   "past_days": 3, "forecast_days": 16}, keys, None, parser=parse_daily)
+    try:
+        months = sorted({(days[0] + dt.timedelta(k)).month for k in range(-7, 23)})
+        D["river_clim"] = archive_months(cache_dir, "klima_abfluss_glofas_v1.json", RIVERS, keys,
+                                         ["river_discharge"], months, [""], api=API_FLOOD)
+    except (ApiError, OSError) as e:
+        log(f"Abfluss-Klimatologie ({e})")
+        D["river_clim"] = None
+    ak = list(ALETSCH)
+    _m, D["aletsch"] = fetch_model(API_FC, "Aletsch-Höhenstufen", ["best_match"],
+                                   {**coords(ak, ALETSCH), "hourly": "temperature_2m", "timezone": TZNAME,
+                                    "forecast_days": len(days)}, ak, days)
+
+
+def river_diag(D, X):
+    R, C = D.get("rivers") or {}, D.get("river_clim")
+    out = []
+    today = X["days"][0]
+    for k, meta in RIVERS.items():
+        rec = R.get(k)
+        if not rec or not rec.get("d"):
+            continue
+        v = rec["v"]
+        g = lambda name, i: (v.get(name) or [None] * len(rec["d"]))[i]
+        idx_today = next((i for i, d in enumerate(rec["d"]) if d == today), None)
+        if idx_today is None:
+            continue
+        now = g("river_discharge", idx_today)
+        fut = [(rec["d"][i], g("river_discharge_median", i), g("river_discharge_max", i), g("river_discharge_p75", i))
+               for i in range(idx_today, len(rec["d"]))]
+        fut = [f for f in fut if f[1] is not None]
+        if now is None or not fut:
+            continue
+        pk_med = max(fut, key=lambda f: f[1])
+        pk_max = max((f for f in fut if f[2] is not None), key=lambda f: f[2], default=None)
+        cl = window_vals(C, k, today, "river_discharge", half=7) if C else []
+        cl_all = []
+        if C:
+            for d in {f[0] for f in fut}:
+                cl_all += window_vals(C, k, d, "river_discharge", half=3)
+        res = {"name": meta["name"], "now": now, "pk_med": pk_med, "pk_max": pk_max}
+        if len(cl) >= 100:
+            res.update(clim_med=quant(cl, .5), clim_p90=quant(cl, .9), rank=sum(1 for x in cl if x < now) / len(cl))
+        if len(cl_all) >= 100:
+            res["clim_max"] = max(cl_all)
+        out.append(res)
+    return out
+
+
+def aletsch_diag(D, X):
+    A = D.get("aletsch") or {}
+    out = {}
+    for k, meta in ALETSCH.items():
+        rec = A.get(k)
+        if not rec:
+            continue
+        row = {}
+        for d in X["days"]:
+            T = valid([rec["v"].get("temperature_2m", [None] * len(rec["t"]))[i] for i in rec["idx"].get(d, [])])
+            if len(T) >= 20:
+                row[d] = {"pdd": sum(max(t, 0.0) for t in T) / len(T), "hrs": sum(1 for t in T if t > 0),
+                          "tmax": max(T)}
+        out[meta["elev"]] = row
+    return out
+
+
+def day_records(cache, loc, d):
+    b = None
+    for block in (cache or {}).get("months", {}).values():
+        if loc in block:
+            b = block[loc] if b is None else {kk: b[kk] + block[loc][kk] for kk in b}
+    if not b:
+        return None
+    md = f"-{d.month:02d}-{d.day:02d}"
+    rows = [(ds[:4], tx, tn, pr) for ds, tx, tn, pr in zip(b["date"], b["tmax"], b["tmin"], b["prec"]) if ds.endswith(md)]
+    rows = [r for r in rows if r[1] is not None and r[2] is not None]
+    if len(rows) < 20:
+        return None
+    hot, cold = max(rows, key=lambda r: r[1]), min(rows, key=lambda r: r[2])
+    wet = max(rows, key=lambda r: r[3] or 0)
+    return {"hot": (hot[1], hot[0]), "cold": (cold[2], cold[0]), "wet": (wet[3], wet[0]), "n": len(rows)}
+
+
+MOON_NAMES = ((1.85, "Neumond"), (5.54, "zunehmende Sichel"), (9.23, "erstes Viertel"), (12.92, "zunehmender Mond"),
+              (16.61, "Vollmond"), (20.30, "abnehmender Mond"), (23.99, "letztes Viertel"),
+              (27.68, "abnehmende Sichel"), (29.54, "Neumond"))
+
+
+def moon(d):
+    syn = 29.530588853
+    ref = dt.datetime(2000, 1, 6, 18, 14, tzinfo=dt.timezone.utc)
+    t = dt.datetime(d.year, d.month, d.day, 21, tzinfo=TZ)
+    age = ((t - ref).total_seconds() / 86400) % syn
+    name = next(nm for lim, nm in MOON_NAMES if age < lim)
+    illum = (1 - math.cos(2 * math.pi * age / syn)) / 2
+    to_full = (14.765 - age) % syn
+    return {"age": age, "name": name, "illum": illum, "full": d + dt.timedelta(days=round(to_full))}
+
+
+AQI_WORDS = ((20, "gut"), (40, "recht gut"), (60, "mässig"), (80, "schlecht"), (100, "sehr schlecht"))
+POLLEN = {"birch_pollen": "Birke", "grass_pollen": "Gräser", "alder_pollen": "Erle", "mugwort_pollen": "Beifuss",
+          "ragweed_pollen": "Ambrosia"}
+
+
+def air_text(X, d):
+    a = (X.get("air") or {}).get(d)
+    if not a:
+        return ""
+    bits = []
+    if a.get("aqi") is not None and a["aqi"] >= 40:
+        word = next((w for lim, w in AQI_WORDS if a["aqi"] < lim), "extrem schlecht")
+        bits.append(f"Luftqualität (Europäischer Index, CAMS) bis {n(a['aqi'])}, {word}")
+    pol = [(POLLEN[k], v) for k, v in a.get("pollen", {}).items() if v is not None and v >= 10]
+    if pol:
+        bits.append("Pollen: " + join_de([f"{nm} {'stark' if v >= 50 else 'mässig'} ({n(v)} Körner/m³)" for nm, v in pol]))
+    return (". ".join(bits) + ".") if bits else ""
+
+
+def mch_section(X):
+    M = X.get("mch")
+    if not M:
+        return []
+    out = ["### Vergleich mit der offiziellen Prognose von MeteoSchweiz", ""]
+    A = out.append
+    run = M["run"].astimezone(TZ)
+    pr = M["data"].get("riederalp") or {}
+    LD = X["local"]["riederalp"]
+    rows = [d for d in X["days"] if d in pr.get("tre200px", {})]
+    if rows:
+        nm = (M["points"].get("riederalp") or ["", "", "Riederalp"])[2]
+        A(f"Lokalprognose für {nm} (Lauf {run:%d.%m. %H:%M} Uhr), daneben die Werte dieses Berichts.")
+        A("")
+        A("| Tag | MeteoSchweiz | Min / Max MCH | Min / Max Bericht | Niederschlag MCH (10–90 %) | Bericht |")
+        A("|---|---|---|---|---|---|")
+        diffs = []
+        for d in rows:
+            s = LD.get(d)
+            tx, tn = pr["tre200px"].get(d), pr.get("tre200pn", {}).get(d)
+            q10, q90 = pr.get("rreq10p0", {}).get(d), pr.get("rreq90p0", {}).get(d)
+            ptxt = (f"{n(pr.get('rka150p0', {}).get(d), 1)} mm" + (f" ({n(q10, 1)}–{n(q90, 1)})" if q10 is not None and q90 is not None else ""))
+            A(f"| {dshort(d)} | {picto(pr.get('jp2000d0', {}).get(d))} | {n(tn)} / {n(tx)} °C | "
+              + (f"{n(s['tmin'])} / {n(s['tmax'])} °C | {ptxt} | {n(s['prec'], 1)} mm |" if s else f"– | {ptxt} | – |"))
+            if s and tx is not None:
+                diffs.append((d, s["tmax"] - tx))
+        A("")
+        if diffs:
+            mx = max(diffs, key=lambda x: abs(x[1]))
+            A(f"Mittlere Abweichung des Höchstwerts (Bericht minus MeteoSchweiz): "
+              f"{sgn(sum(x[1] for x in diffs) / len(diffs))} K; grösste am {dshort(mx[0])} mit {sgn(mx[1])} K. "
+              "MeteoSchweiz kombiniert INCA, ICON-CH1/2-EPS und ECMWF mit statistischer Nachbearbeitung an Messstationen; "
+              "dieser Bericht verwendet die Rohmodelle. Grosse Unterschiede zeigen, wo die Nachbearbeitung eingreift.")
+            A("")
+    st = [k for k in MCH_SEL if k != "riederalp" and (M["data"].get(k) or {}).get("tre200px")]
+    d0, d1 = X["days"][0], X["days"][1]
+    if st:
+        A("| Station | heute MCH / Bericht | morgen MCH / Bericht |")
+        A("|---|---|---|")
+        dd = []
+        for k in st:
+            mx = M["data"][k]["tre200px"]
+            cells = []
+            for d in (d0, d1):
+                s = X["local"][k].get(d)
+                cells.append(f"{n(mx.get(d))} / {n(s['tmax']) if s else '–'} °C")
+                if s and mx.get(d) is not None:
+                    dd.append(abs(s["tmax"] - mx[d]))
+            A(f"| {LOCAL[k]['name']} | {cells[0]} | {cells[1]} |")
+        A("")
+        if dd:
+            A(f"Höchstwerte heute und morgen an {len(st)} Stationen: mittlere absolute Differenz {n(sum(dd) / len(dd), 1)} K. "
+              "Quelle der Lokalprognose: MeteoSchweiz.")
+            A("")
+    return out
+
+
+def river_section(X):
+    R = X.get("rivers") or []
+    if not R:
+        return []
+    out = ["### Abfluss", "", "GloFAS-Simulation (Copernicus) über Open-Meteo: heutiger Abfluss, Einordnung gegenüber "
+           "1991–2020 (±7 Tage) und Spitze der nächsten 16 Tage.", ""]
+    for r in R:
+        t = f"- **{r['name']}:** heute {n(r['now'])} m³/s"
+        if r.get("clim_med"):
+            t += f" (Median der Jahreszeit {n(r['clim_med'])} m³/s, {int(round(r['rank'] * 100))}. Perzentil)"
+        t += f"; Spitze im Ensemble-Median {n(r['pk_med'][1])} m³/s am {dshort(r['pk_med'][0])}"
+        if r.get("pk_max") and r["pk_max"][2] is not None:
+            t += f", im ungünstigsten Member {n(r['pk_max'][2])} m³/s"
+            if r.get("clim_max") and r["pk_max"][2] > r["clim_max"]:
+                t += f", mehr als der höchste Wert dieser Jahreszeit 1991–2020 ({n(r['clim_max'])} m³/s)"
+        out.append(t + ".")
+    out += ["", "Grenzen: Der Abfluss von Rhône und Ticino ist durch Speicherkraftwerke stark reguliert, was GloFAS nur "
+            "vereinfacht abbildet; das 0,05°-Raster trifft kleine Flüsse nicht. Massgebend sind die Hochwasserwarnungen "
+            "des Bundes (naturgefahren.ch).", ""]
+    return out
+
+
+def aletsch_section(X):
+    A_ = X.get("aletsch") or {}
+    if not A_:
+        return []
+    days = [d for d in X["days"] if any(d in A_[z] for z in A_)]
+    out = ["### Aletschgletscher: Schmelzpotenzial", "",
+           "Positive Gradtage (Tagesmittel der Stundentemperaturen über 0 °C) auf drei Höhenstufen des Gletschers, daraus "
+           "die Schmelze mit Gradtagfaktoren von 4 mm pro K und Tag für Schnee und 8 mm für Eis.", "",
+           "| Tag | " + " | ".join(f"{z} m" for z in sorted(A_)) + " |", "|---|" + "---|" * len(A_)]
+    tot = {z: 0.0 for z in A_}
+    for d in days:
+        cells = []
+        for z in sorted(A_):
+            r = A_[z].get(d)
+            if r:
+                tot[z] += r["pdd"]
+                cells.append("0" if r["pdd"] < 0.05 else f"{n(r['pdd'], 1)} K·d ({n(4 * r['pdd'])}–{n(8 * r['pdd'])} mm)")
+            else:
+                cells.append("–")
+        out.append(f"| {dshort(d)} | " + " | ".join(cells) + " |")
+    out.append("")
+    z27 = tot.get(2700)
+    if z27 is not None:
+        if z27 < 0.05:
+            out.append(f"Auf 2700 m (etwa Konkordiaplatz) bleibt es bis {dshort(days[-1])} ohne positive Gradtage, also ohne "
+                       "nennenswertes Schmelzpotenzial" + (f"; Schmelze nur unterhalb davon ({n(tot.get(2200, 0), 1)} Gradtage auf "
+                                                           "2200 m)." if (tot.get(2200) or 0) >= 0.05 else "."))
+        else:
+            out.append(f"Summe bis {dshort(days[-1])} auf 2700 m (etwa Konkordiaplatz): {n(z27, 1)} Gradtage, also "
+                       f"{n(4 * z27)} bis {n(8 * z27)} mm Wasseräquivalent. Heller Neuschnee reflektiert mehr Strahlung, "
+                       "als ein Gradtagmodell annimmt; Staub und blankes Eis verstärken die Schmelze.")
+        out.append("")
+    return out
+
+
+def status_table():
+    if not STATUS:
+        return []
+    seen = {}
+    for name, ok, info in STATUS:
+        seen[name] = (ok, info) if name not in seen or ok else seen[name]
+    out = ["**Datenquellen in diesem Lauf:**", "", "| Quelle | Status | Hinweis |", "|---|---|---|"]
+    for name, (ok, info) in seen.items():
+        out.append(f"| {name} | {'✓' if ok else '✗'} | {info.replace('|', '/')} |")
+    return out + [""]
+
+
+def safe_lines(fn, *args, title=None):
+    """Ein Fehler in einem Abschnitt darf nie den ganzen Bericht verhindern."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 - bewusst breit: Bericht muss erscheinen
+        log(f"Abschnitt {title or fn.__name__} ({type(e).__name__}: {e})")
+        return ([f"## {title}", ""] if title else []) + [f"Dieser Abschnitt konnte nicht erstellt werden "
+                                                          f"({type(e).__name__}).", ""]
+
+
+def load_model_ids(cache_dir):
+    try:
+        with open(os.path.join(cache_dir, "modell_ids_v1.json"), encoding="utf-8") as f:
+            MODEL_IDS.update(json.load(f))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def save_model_ids(cache_dir):
+    try:
+        with open(os.path.join(cache_dir, "modell_ids_v1.json"), "w", encoding="utf-8") as f:
+            json.dump(MODEL_IDS, f)
+    except OSError:
+        pass
 
 
 # ================================================================ Karten
@@ -4269,8 +4760,12 @@ def slug(s):
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-")
 
 
+COLLAPSE = {"Methodik und Quellen"}
+
+
 def md_to_html(md, charts):
     out, para, i = [], [], 0
+    open_details = [False]
     lines = md.split("\n")
 
     def flush():
@@ -4296,8 +4791,15 @@ def md_to_html(md, charts):
         if h:
             flush()
             lvl, txt = len(h.group(1)), h.group(2)
+            if lvl == 2 and open_details[0]:
+                out.append("</details>")
+                open_details[0] = False
             idattr = f' id="{slug(txt)}"' if lvl == 2 else ""
-            out.append(f"<h{lvl}{idattr}>{inline(txt)}</h{lvl}>")
+            if lvl == 2 and txt in COLLAPSE:
+                out.append(f'<details class="sec"><summary><h2{idattr}>{inline(txt)}</h2></summary>')
+                open_details[0] = True
+            else:
+                out.append(f"<h{lvl}{idattr}>{inline(txt)}</h{lvl}>")
             i += 1
             continue
         if ln.startswith("- "):
@@ -4328,6 +4830,8 @@ def md_to_html(md, charts):
         para.append(ln)
         i += 1
     flush()
+    if open_details[0]:
+        out.append("</details>")
     return "\n".join(out)
 
 
@@ -4442,6 +4946,11 @@ svg .rmark{fill:#fff;stroke:#b0302a;stroke-width:2}
 svg .ocean{fill:var(--water);opacity:.55}
 svg .coastw{fill:none;stroke:var(--ink);stroke-width:.7;opacity:.6}
 svg .wdot{stroke:#1c2328;stroke-width:.6}
+details.sec>summary{list-style:none;cursor:pointer}
+details.sec>summary::-webkit-details-marker{display:none}
+details.sec>summary h2::after{content:" ▸";color:var(--muted);font-weight:400}
+details.sec[open]>summary h2::after{content:" ▾"}
+details.sec>summary:focus-visible{outline:2px solid var(--ice);outline-offset:4px}
 .mlegend{display:flex;flex-wrap:wrap;gap:.25rem .7rem;font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;
 font-size:.86rem;color:var(--muted);padding:.55rem .2rem 0}
 .mlegend span{display:inline-flex;align-items:center;gap:.3rem}
@@ -4471,7 +4980,7 @@ def render_html(md, charts, X):
 <body>
 <main>
 {body}
-<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Messwerte: Quelle MeteoSchweiz. Lawinenbulletin: SLF (slf.ch). Naturgefahren: GDACS. ENSO: NOAA CPC. Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
+<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Messwerte und Lokalprognose: Quelle MeteoSchweiz. Lawinenbulletin: SLF (slf.ch). Abfluss: GloFAS (Copernicus). Naturgefahren: GDACS. ENSO: NOAA CPC. Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
 </main>
 </body>
 </html>"""
@@ -4532,6 +5041,7 @@ def main():
     global CACHE_DIR
     CACHE_DIR = args.cache
     os.makedirs(args.cache, exist_ok=True)
+    load_model_ids(args.cache)
     now = dt.datetime.now(TZ)
     days = [now.date() + dt.timedelta(i) for i in range(max(3, min(10, args.days)))]
     D = collect(days, args.cache)
@@ -4557,7 +5067,8 @@ def main():
     diag = {k: v for k, v in X.items() if k not in ("ens_hourly", "det_hourly")}
     with open(os.path.join(args.out, "diagnostik.json"), "w", encoding="utf-8") as f:
         json.dump(to_jsonable(diag), f, ensure_ascii=False, indent=1)
-    kurz = short_summary(X, insights(X))
+    save_model_ids(args.cache)
+    kurz = short_summary(X, safe_lines(insights, X))
     with open(os.path.join(args.out, "kurz.txt"), "w", encoding="utf-8") as f:
         f.write(kurz + "\n")
     push_ntfy(kurz)

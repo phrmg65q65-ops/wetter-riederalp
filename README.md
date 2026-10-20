@@ -19,6 +19,14 @@ Dazu kommen Messwerte und Prüfungen:
 
 Ein Kapitel **Welt** zeigt das Wetter an 46 Orten auf allen Kontinenten, an beiden Polen und auf Gipfeln, mit Weltkarte. Dazu kommen aktive tropische Wirbelstürme, Überschwemmungen, Dürren und Waldbrände (GDACS) und der ENSO-Zustand (NOAA). Das Kapitel **Fun Facts** sammelt Auffälliges aus den aktuellen Messwerten aller Schweizer Stationen sowie aus Europa und der Welt.
 
+Weitere Teile:
+- **Vergleich mit MeteoSchweiz:** die offizielle Lokalprognose für Riederalp (Postleitzahl 3987) und zwölf Messstationen neben den Werten dieses Berichts, mit Wettertext und Niederschlagsbereich. Grosse Abweichungen erscheinen in den Kernaussagen.
+- **Abfluss:** Rhône bei Sion und bei Porte du Scex sowie Ticino bei Bellinzona, 16 Tage im GloFAS-Ensemble und gemessen an 1991–2020.
+- **Aletschgletscher:** das Schmelzpotenzial auf 2200, 2700 und 3300 m nach dem Gradtagmodell.
+- **Kleinere Ergänzungen:** Rekorde des Kalendertags 1991–2020, Mondphase, Luftqualität und Pollen.
+
+Die Methodik zeigt eine Tabelle aller Datenquellen mit ihrem Status im jeweiligen Lauf. Ein Fehler in einem einzelnen Abschnitt verhindert nie den ganzen Bericht.
+
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.
 
 ## Täglich als Webseite (GitHub Actions + Pages)
