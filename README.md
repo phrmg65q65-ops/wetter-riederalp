@@ -17,6 +17,8 @@ Dazu kommen Messwerte und Prüfungen:
 - **Zwei-Wochen-Tendenz:** aus dem ECMWF-Ensemble, als Wochenanomalien mit Wahrscheinlichkeiten.
 - **Praktisches:** UV-Index, Sonnenzeiten und eine Tabelle «Auf einen Blick».
 
+Ein Kapitel **Welt** zeigt das Wetter an 46 Orten auf allen Kontinenten, an beiden Polen und auf Gipfeln, mit Weltkarte. Dazu kommen aktive tropische Wirbelstürme, Überschwemmungen, Dürren und Waldbrände (GDACS) und der ENSO-Zustand (NOAA). Das Kapitel **Fun Facts** sammelt Auffälliges aus den aktuellen Messwerten aller Schweizer Stationen sowie aus Europa und der Welt.
+
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.
 
 ## Täglich als Webseite (GitHub Actions + Pages)
@@ -31,6 +33,16 @@ Hinweise: Pages für private Repositories braucht ein kostenpflichtiges GitHub-K
 
 Optional: Ein Repository-Secret `ANTHROPIC_API_KEY` fügt eine von Claude formulierte synoptische Einordnung hinzu (Modell über `WB_CLAUDE_MODEL` änderbar, Standard `claude-sonnet-5-5`).
 
+### Optional: Push-Nachricht aufs Handy
+
+Jeden Morgen eine kurze Nachricht mit dem Wetter für heute und morgen und den drei wichtigsten Kernaussagen; ein Tipp darauf öffnet den Bericht.
+
+1. Die kostenlose App **ntfy** installieren (App Store oder Google Play).
+2. Einen schwer zu erratenden Kanalnamen ausdenken, zum Beispiel `riederalp-wetter-7k3q9x`, und ihn in der App abonnieren («Subscribe to topic»).
+3. Im Repository unter *Settings → Secrets and variables → Actions → New repository secret* den Namen `NTFY_TOPIC` und als Wert den Kanalnamen eintragen.
+
+Die Nachricht kommt nur beim Morgenlauf. Wer den Kanalnamen kennt, kann mitlesen; deshalb einen zufälligen wählen.
+
 ## Lokal, per Cron oder auf Databricks
 
 ```
@@ -41,7 +53,7 @@ Optional: Umgebungsvariable `OPEN_METEO_API_KEY` für einen kommerziellen Open-M
 
 Python 3.9 oder neuer, nur Standardbibliothek (unter Windows zusätzlich `pip install tzdata`). Optionen: `--days 3..10`, `--cache ORDNER`, `--claude`.
 
-Ausgabe: `index.html` (Bericht mit Grafiken, hell/dunkel), `bericht.md` (gleicher Text) und `diagnostik.json` (alle Kennzahlen).
+Ausgabe: `index.html` (Bericht mit Grafiken, hell/dunkel), `bericht.md` (gleicher Text), `diagnostik.json` (alle Kennzahlen) und `kurz.txt` (Kurzfassung für Nachrichten).
 
 Der erste Lauf eines Kalendermonats lädt die ERA5-Land-Klimatologie (30 Abfragen, dauert etwa eine Minute) und speichert sie im Cache. Ein normaler Lauf braucht rund zwei Minuten und einige hundert gewichtete Open-Meteo-Aufrufe (Gratislimit: 10 000 pro Tag, nur nicht-kommerziell).
 

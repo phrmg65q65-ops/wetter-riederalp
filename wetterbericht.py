@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import gzip
 import datetime as dt
 import html
 import json
@@ -47,7 +48,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.3"
+VERSION = "1.4"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -130,6 +131,7 @@ MAPS = {
     "schweiz": {"bbox": (45.75, 47.85, 5.85, 10.55), "W": 420, "z": 8, "vex": 3.0},
     "wallis": {"bbox": (45.85, 46.65, 6.75, 8.45), "W": 420, "z": 9, "vex": 2.0},
     "riederalp": {"bbox": (46.34, 46.56, 7.90, 8.18), "W": 420, "z": 11, "vex": 1.3},
+    "welt": {"bbox": (-90.0, 84.0, -180.0, 180.0), "W": 420},
 }
 EU_LATS = [32 + 3 * i for i in range(14)]
 EU_LONS = [-24 + 3 * i for i in range(22)]
@@ -206,9 +208,13 @@ def fetch_json(url, params=None, timeout=90, retries=4, quiet=False):
     last = None
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(full, headers={"User-Agent": UA, "Accept": "application/json"})
+            req = urllib.request.Request(full, headers={"User-Agent": UA, "Accept": "application/json",
+                                                        "Accept-Encoding": "gzip"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                raw = r.read()
+                if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                    raw = gzip.decompress(raw)
+                return json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
             try:
@@ -409,6 +415,8 @@ def collect(days, cache_dir):
     D["ens15"] = e15["riederalp"] if e15 else None
     D["obs"] = collect_obs(cache_dir)
     D["slf"] = collect_slf()
+    D["welt"] = collect_world()
+    D["swiss_now"] = collect_swiss_now(cache_dir)
 
     print("Klimatologie ERA5-Land …", file=sys.stderr)
     D["clim"] = clim_fetch(cache_dir, d15)
@@ -1051,6 +1059,9 @@ def diagnose_extra(D, X):
     X["slf"], X["slf_level"] = D.get("slf"), slf_level(D.get("slf"))
     X["nao"] = nao_proxy(D, X, D.get("nao_clim"))
     X["weeks"] = week_trend(D["ens15"], D["clim"], X) if D.get("ens15") else []
+    Wd = D.get("welt") or {}
+    X["world_raw"], X["peaks"], X["gdacs"], X["enso"] = Wd.get("world"), Wd.get("peaks"), Wd.get("gdacs"), Wd.get("enso")
+    X["swiss_now"] = D.get("swiss_now") or []
     X["sun"] = {}
     sr = (D.get("sun") or {}).get("riederalp")
     if sr:
@@ -1478,6 +1489,10 @@ def build_report(X):
     else:
         A("Druckflächendaten nicht verfügbar.")
         A("")
+
+    # ---------- Welt und Fun Facts
+    out.extend(world_section(X))
+    out.extend(fun_section(X))
 
     # ---------- Unsicherheiten
     A("## Unsicherheiten und Modellvergleich")
@@ -2114,6 +2129,13 @@ def insights(X):
         if w["label"] == "Woche 2" and w["p_warm"] is not None and (w["p_warm"] >= 0.8 or w["p_warm"] <= 0.2):
             I.append((5, f"Tendenz {dshort(w['from'])} bis {dshort(w['to'])}: mit {pct(max(w['p_warm'], 1 - w['p_warm']))} "
                          f"{'wärmer' if w['p_warm'] >= 0.5 else 'kälter'} als 1991–2020 (Median {sgn(w['an']['p50'])} K)."))
+    big = [e for e in (X.get("gdacs") or []) if e["alert"] in ("Red", "Orange")]
+    if big:
+        e = big[0]
+        I.append((6 if e["alert"] == "Red" else 4,
+                  f"Weltweit: {GDACS_TYPES[e['type']]} {e['name'] or e['desc']}".rstrip()
+                  + (f" ({e['country']})" if e["country"] else "")
+                  + f", GDACS-Warnstufe {'Rot' if e['alert'] == 'Red' else 'Orange'}."))
     blk = [d for d in days if X["eu"].get(d, {}).get("blocked")]
     if blk:
         I.append((6, f"Blockierung (Tibaldi-Molteni) ab {dshort(blk[0])} bei "
@@ -2287,6 +2309,11 @@ def method_section(X):
     A("**Lawinen:** CAAML-Bulletin des SLF für die Warnregion 4214 Riederalp; massgebend ist immer das Bulletin auf "
       "slf.ch. **NAO-Proxy:** tägliches Mittel des Bodendrucks in Lissabon und Reykjavík, je standardisiert gegen "
       "ERA5 1991–2020 (±7 Tage), Differenz nach Hurrell. **Tendenz:** ECMWF ENS bis 15 Tage gegen ERA5-Land.")
+    A("")
+    A("**Welt und Fun Facts:** Tagesvorhersage (Open-Meteo, beste verfügbare Modelle) für 46 Orte in Ortszeit; "
+      "Gipfelwerte statistisch auf die Gipfelhöhe skaliert. Naturgefahren: GDACS-Ereignisliste der letzten 14 Tage, "
+      "nur aktive Ereignisse. ENSO: wöchentliche relative Niño-3.4-Anomalie von NOAA CPC. Schweizweite Messwerte: "
+      "aktuelle 10-Minuten-Werte aller SwissMetNet-Stationen (MeteoSchweiz).")
     A("")
     A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
@@ -2616,13 +2643,19 @@ def collect_obs(cache_dir):
     R = LOCAL["riederalp"]
     near = sorted(({**s, "km": km(R["lat"], R["lon"], s["lat"], s["lon"])} for s in st), key=lambda s: s["km"])
     O["stations"] = [s for s in near if s["km"] <= OBS_RADIUS_KM][:OBS_MAX]
-    for s in O["stations"]:
-        for gran, upd in (("h", "now"), ("d", "recent")):
-            try:
-                O["now" if upd == "now" else "recent"][s["abbr"]] = smn_get(s["abbr"], gran, upd)
-            except (ApiError, ValueError) as e:
-                log(f"MeteoSchweiz {s['abbr']} {gran}_{upd} ({e})")
-            time.sleep(0.2)
+    tasks = [(s["abbr"], gran, upd) for s in O["stations"] for gran, upd in (("h", "now"), ("d", "recent"))]
+
+    def get(t):
+        try:
+            return t, smn_get(*t), None
+        except (ApiError, ValueError) as e:
+            return t, None, e
+
+    for (a, gran, upd), res, err in pmap(get, tasks, workers=6):
+        if res is not None:
+            O["now" if upd == "now" else "recent"][a] = res
+        else:
+            log(f"MeteoSchweiz {a} {gran}_{upd} ({err})")
     if O["stations"]:
         print("Lade frühere Modellläufe für die Verifikation …", file=sys.stderr)
         tab = {s["abbr"]: _p(s["name"], s["lat"], s["lon"], int(round(s["elev"]))) for s in O["stations"]}
@@ -2965,9 +2998,458 @@ def week_trend(rec, clim, X):
     return out
 
 
+# ================================================================ Welt und Fun Facts
+WORLD = {  # Schlüssel: (Name, Breite, Länge, Region)
+    "kairo": ("Kairo", 30.04, 31.24, "Afrika"), "lagos": ("Lagos", 6.52, 3.38, "Afrika"),
+    "nairobi": ("Nairobi", -1.29, 36.82, "Afrika"), "kapstadt": ("Kapstadt", -33.92, 18.42, "Afrika"),
+    "timbuktu": ("Timbuktu", 16.77, -3.01, "Afrika"), "kinshasa": ("Kinshasa", -4.32, 15.31, "Afrika"),
+    "addis": ("Addis Abeba", 9.03, 38.74, "Afrika"),
+    "delhi": ("Delhi", 28.61, 77.21, "Asien"), "mumbai": ("Mumbai", 19.08, 72.88, "Asien"),
+    "peking": ("Peking", 39.90, 116.40, "Asien"), "tokio": ("Tokio", 35.68, 139.69, "Asien"),
+    "singapur": ("Singapur", 1.35, 103.82, "Asien"), "riad": ("Riad", 24.71, 46.68, "Asien"),
+    "dubai": ("Dubai", 25.20, 55.27, "Asien"), "jakutsk": ("Jakutsk", 62.03, 129.73, "Asien"),
+    "oimjakon": ("Oimjakon", 63.46, 142.79, "Asien"), "lhasa": ("Lhasa", 29.65, 91.17, "Asien"),
+    "bangkok": ("Bangkok", 13.76, 100.50, "Asien"), "cherrapunji": ("Cherrapunji", 25.27, 91.73, "Asien"),
+    "ahvaz": ("Ahvaz", 31.32, 48.67, "Asien"),
+    "sydney": ("Sydney", -33.87, 151.21, "Ozeanien"), "perth": ("Perth", -31.95, 115.86, "Ozeanien"),
+    "alice": ("Alice Springs", -23.70, 133.88, "Ozeanien"), "auckland": ("Auckland", -36.85, 174.76, "Ozeanien"),
+    "honolulu": ("Honolulu", 21.31, -157.86, "Ozeanien"),
+    "newyork": ("New York", 40.71, -74.01, "Nordamerika"), "chicago": ("Chicago", 41.88, -87.63, "Nordamerika"),
+    "losangeles": ("Los Angeles", 34.05, -118.24, "Nordamerika"),
+    "deathvalley": ("Death Valley", 36.46, -116.87, "Nordamerika"),
+    "mexiko": ("Mexiko-Stadt", 19.43, -99.13, "Nordamerika"), "anchorage": ("Anchorage", 61.22, -149.90, "Nordamerika"),
+    "utqiagvik": ("Utqiaġvik", 71.29, -156.79, "Nordamerika"), "miami": ("Miami", 25.76, -80.19, "Nordamerika"),
+    "toronto": ("Toronto", 43.65, -79.38, "Nordamerika"),
+    "rio": ("Rio de Janeiro", -22.91, -43.17, "Südamerika"), "buenosaires": ("Buenos Aires", -34.60, -58.38, "Südamerika"),
+    "lima": ("Lima", -12.05, -77.04, "Südamerika"), "manaus": ("Manaus", -3.12, -60.02, "Südamerika"),
+    "ushuaia": ("Ushuaia", -54.80, -68.30, "Südamerika"), "lapaz": ("La Paz", -16.50, -68.15, "Südamerika"),
+    "atacama": ("San Pedro de Atacama", -22.91, -68.20, "Südamerika"),
+    "wostok": ("Wostok", -78.46, 106.84, "Polargebiete"), "suedpol": ("Südpol-Station", -89.99, 0.0, "Polargebiete"),
+    "mcmurdo": ("McMurdo", -77.85, 166.67, "Polargebiete"), "summit": ("Summit (Grönland)", 72.58, -38.46, "Polargebiete"),
+    "longyearbyen": ("Longyearbyen", 78.22, 15.65, "Polargebiete"),
+}
+PEAKS = {"everest": _p("Mount Everest", 27.9881, 86.9250, 8848), "montblanc": _p("Mont Blanc", 45.8326, 6.8652, 4806)}
+WORLD_DAILY = ("weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum,"
+               "wind_gusts_10m_max,daylight_duration")
+API_GDACS = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH"
+CPC_NINO = "https://www.cpc.ncep.noaa.gov/data/indices/rel_wksst9120.txt"
+VQHA80 = "https://data.geo.admin.ch/ch.meteoschweiz.messwerte-aktuell/VQHA80.csv"
+GDACS_TYPES = {"TC": "Tropischer Wirbelsturm", "FL": "Überschwemmung", "DR": "Dürre", "WF": "Waldbrand"}
+MON = {m: i + 1 for i, m in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"))}
+
+
+ORT_IN = {"Death Valley": "im Death Valley", "Südpol-Station": "an der Südpol-Station",
+          "Summit (Grönland)": "auf Summit (Grönland)", "Wostok": "in Wostok (Antarktis)"}
+
+
+def ort_in(name):
+    return ORT_IN.get(name, f"in {name}")
+
+
+def wmo_text(c):
+    if c is None:
+        return "–"
+    c = int(c)
+    for lo, hi, t in ((0, 0, "klar"), (1, 1, "überwiegend klar"), (2, 2, "teils bewölkt"), (3, 3, "bedeckt"),
+                      (45, 48, "Nebel"), (51, 57, "Niesel"), (61, 67, "Regen"), (71, 77, "Schnee"),
+                      (80, 82, "Schauer"), (85, 86, "Schneeschauer"), (95, 99, "Gewitter")):
+        if lo <= c <= hi:
+            return t
+    return "–"
+
+
+def pmap(fn, items, workers=6):
+    """Netzwerkzugriffe parallel (I/O-gebunden); Reihenfolge bleibt erhalten."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
+
+
+def collect_world():
+    W = {"world": None, "peaks": None, "gdacs": None, "enso": None}
+    print("Lade Weltwetter …", file=sys.stderr)
+    tab = {k: _p(v[0], v[1], v[2]) for k, v in WORLD.items()}
+    keys = list(tab)
+    _m, W["world"] = fetch_model(API_FC, "Weltwetter", ["best_match"],
+                                 {**coords(keys, tab, elev=False), "daily": WORLD_DAILY, "timezone": "auto",
+                                  "forecast_days": 2}, keys, None, parser=parse_daily)
+    _m, W["peaks"] = fetch_model(API_FC, "Gipfelwetter", ["best_match"],
+                                 {**coords(list(PEAKS), PEAKS), "daily": "temperature_2m_max,temperature_2m_min,"
+                                  "wind_gusts_10m_max", "timezone": "auto", "forecast_days": 1},
+                                 list(PEAKS), None, parser=parse_daily)
+    print("Lade Naturgefahren (GDACS) …", file=sys.stderr)
+    try:
+        t = dt.date.today()
+        url = (f"{API_GDACS}?eventlist=TC;FL;DR;WF&fromdate={t - dt.timedelta(14)}&todate={t}"
+               "&alertlevel=green;orange;red")
+        W["gdacs"] = parse_gdacs(json.loads(fetch_bytes(url, timeout=60).decode("utf-8")))
+    except (ApiError, ValueError, UnicodeDecodeError) as e:
+        log(f"GDACS ({e})")
+    print("Lade ENSO-Index (NOAA CPC) …", file=sys.stderr)
+    try:
+        W["enso"] = parse_nino(fetch_bytes(CPC_NINO, timeout=30).decode("latin-1"))
+    except (ApiError, ValueError) as e:
+        log(f"ENSO-Index ({e})")
+    return W
+
+
+def parse_gdacs(data):
+    def first_xy(c):
+        while isinstance(c, list) and c and isinstance(c[0], list):
+            c = c[0]
+        return (c[1], c[0]) if isinstance(c, list) and len(c) >= 2 else (None, None)
+
+    out = []
+    for f in (data or {}).get("features") or []:
+        p = {str(k).lower(): v for k, v in (f.get("properties") or {}).items()}
+        if str(p.get("iscurrent", "true")).lower() != "true":
+            continue
+        typ = str(p.get("eventtype") or "").upper()
+        if typ not in GDACS_TYPES:
+            continue
+        sev = p.get("severitydata") if isinstance(p.get("severitydata"), dict) else {}
+        url = p.get("url") if isinstance(p.get("url"), dict) else {}
+        lat, lon = first_xy((f.get("geometry") or {}).get("coordinates"))
+        out.append({"type": typ, "name": p.get("eventname") or p.get("name") or "",
+                    "desc": p.get("description") or "", "country": p.get("country") or "",
+                    "alert": str(p.get("alertlevel") or "").capitalize(), "lat": lat, "lon": lon,
+                    "sev": sev.get("severitytext") or "", "report": url.get("report") or ""})
+    rank = {"Red": 0, "Orange": 1, "Green": 2}
+    out.sort(key=lambda e: (rank.get(e["alert"], 3), e["type"]))
+    return out
+
+
+def parse_nino(text):
+    rows = []
+    for ln in text.splitlines():
+        m = re.match(r"\s*(\d{2})([A-Z]{3})(\d{4})\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)\s+(-?\d+\.\d+)", ln)
+        if m and m.group(2) in MON:
+            d = dt.date(int(m.group(3)), MON[m.group(2)], int(m.group(1)))
+            rows.append((d, float(m.group(4)), float(m.group(5)), float(m.group(6)), float(m.group(7))))
+    if not rows:
+        raise ValueError("unbekanntes Format")
+    return rows[-12:]
+
+
+def collect_swiss_now(cache_dir):
+    """Aktuelle 10-Minuten-Werte aller SwissMetNet-Stationen (eine Datei)."""
+    print("Lade aktuelle Messwerte Schweiz …", file=sys.stderr)
+    try:
+        text = fetch_bytes(VQHA80, timeout=30).decode("latin-1")
+        meta = {s["abbr"]: s for s in smn_stations(cache_dir)}
+    except (ApiError, OSError) as e:
+        log(f"Messwerte Schweiz ({e})")
+        return []
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    hi = next((i for i, ln in enumerate(lines) if "tre200s0" in ln), None)
+    if hi is None:
+        log("Messwerte Schweiz (unbekanntes Format)")
+        return []
+    head = [h.strip() for h in lines[hi].split(";")]
+    out = []
+    for ln in lines[hi + 1:]:
+        c = [x.strip() for x in ln.split(";")]
+        if len(c) < len(head) or c[0] not in meta:
+            continue
+        rec = dict(zip(head, c))
+
+        def f(k):
+            try:
+                return float(rec.get(k, "")) if rec.get(k, "-") not in ("", "-") else None
+            except ValueError:
+                return None
+        m = meta[c[0]]
+        out.append({"abbr": c[0], "name": m["name"], "elev": m["elev"], "T": f("tre200s0"),
+                    "rain": f("rre150z0"), "rh": f("ure200s0"), "gust": f("fu3010z1"), "qff": f("pp0qffs0"),
+                    "date": c[1] if len(c) > 1 else ""})
+    return out
+
+
+def world_rows(X):
+    W = X.get("world_raw") or {}
+    rows = []
+    for k, (nm, la, lo, reg) in WORLD.items():
+        rec = W.get(k)
+        if not rec or not rec.get("d"):
+            continue
+        g = lambda v, i=0: (rec["v"].get(v) or [None])[i] if len(rec["v"].get(v) or []) > i else None
+        rows.append({"key": k, "name": nm, "lat": la, "lon": lo, "region": reg, "code": g("weather_code"),
+                     "tmax": g("temperature_2m_max"), "tmin": g("temperature_2m_min"),
+                     "prec": g("precipitation_sum"), "snow": g("snowfall_sum"),
+                     "gust": g("wind_gusts_10m_max"), "day": g("daylight_duration"),
+                     "tmax1": g("temperature_2m_max", 1)})
+    return rows
+
+
+def enso_text(E):
+    if not E:
+        return "Der ENSO-Index von NOAA war bei der Erstellung nicht abrufbar."
+    d, _n12, _n3, n34, _n4 = E[-1]
+    prev = E[-5][3] if len(E) >= 5 else None
+    phase = ("El-Niño-artig" if n34 >= 0.5 else ("La-Niña-artig" if n34 <= -0.5 else "neutral"))
+    t = (f"Niño 3.4, Woche vom {d.day}. {MONATE[d.month - 1]}: {sgn(n34)} K relative Anomalie (gegenüber dem Mittel "
+         f"der gesamten Tropen, NOAA CPC, Basis 1991–2020), also {phase}")
+    if prev is not None:
+        dd = n34 - prev
+        t += f"; gegenüber vor vier Wochen {sgn(dd)} K" + (", Tendenz steigend" if dd >= 0.3 else
+                                                         (", Tendenz fallend" if dd <= -0.3 else ""))
+    t += (". Ein Wochenwert ist noch kein ENSO-Ereignis; dafür braucht es mehrere Monate über der Schwelle. "
+          "Auf das Wetter in den Alpen wirkt ENSO nur schwach, stark dagegen auf die Tropen, Australien und Amerika.")
+    return t
+
+
+def world_section(X):
+    out = ["## Welt", "", "<!--CHART:karte_welt-->", ""]
+    A = out.append
+    rows = world_rows(X)
+    if rows:
+        hot = max((r for r in rows if r["tmax"] is not None), key=lambda r: r["tmax"])
+        cold = min((r for r in rows if r["tmin"] is not None), key=lambda r: r["tmin"])
+        wet = max((r for r in rows if r["prec"] is not None), key=lambda r: r["prec"])
+        t = (f"Unter {len(rows)} Orten auf allen Kontinenten ist es heute {ort_in(hot['name'])} mit {deg(hot['tmax'])} am "
+             f"heissesten und {ort_in(cold['name'])} mit {deg(cold['tmin'])} am kältesten")
+        t += (f"; den meisten Niederschlag erwartet {wet['name']} mit {n(wet['prec'])} mm." if (wet["prec"] or 0) >= 1
+              else "; nirgends ist mehr als 1 mm Niederschlag vorhergesagt.")
+        A(t + " Werte in Ortszeit, Modellvorhersage für heute.")
+        A("")
+        for reg in ("Afrika", "Asien", "Ozeanien", "Nordamerika", "Südamerika", "Polargebiete"):
+            items = [f"{r['name']} {n(r['tmax'])}° {wmo_text(r['code'])}" for r in rows if r["region"] == reg
+                     and r["tmax"] is not None]
+            if items:
+                A(f"- **{reg}:** " + "; ".join(items) + ".")
+        A("")
+    else:
+        A("Die weltweite Vorhersage war bei der Erstellung nicht abrufbar.")
+        A("")
+    G = X.get("gdacs")
+    A("### Naturgefahren aktuell")
+    A("")
+    if G is None:
+        A("Die Ereignisliste von GDACS war bei der Erstellung nicht abrufbar.")
+    elif not G:
+        A("GDACS meldet derzeit keine aktiven tropischen Wirbelstürme, Überschwemmungen, Dürren oder Waldbrände.")
+    else:
+        strong = [e for e in G if e["alert"] in ("Red", "Orange")]
+        cnt = {t: sum(1 for e in G if e["type"] == t) for t in GDACS_TYPES}
+        A("Aktive Ereignisse laut GDACS: " + join_de([f"{c} × {GDACS_TYPES[t]}" for t, c in cnt.items() if c]) + ".")
+        A("")
+        alert_de = {"Red": "Rot", "Orange": "Orange", "Green": "Grün"}
+        for e in (strong or G)[:8]:
+            nm = e["name"] or e["desc"]
+            A(f"- **{GDACS_TYPES[e['type']]}{' ' + nm if nm else ''}**"
+              + (f" ({e['country']})" if e["country"] else "") + f", Warnstufe {alert_de.get(e['alert'], e['alert'])}"
+              + (f", {e['sev']}" if e["sev"] else "") + ".")
+        if not strong:
+            A("")
+            A("Alle aktiven Ereignisse haben die Warnstufe Grün, also geringe erwartete humanitäre Auswirkungen.")
+    A("")
+    A("### El Niño und La Niña")
+    A("")
+    A(enso_text(X.get("enso")))
+    A("")
+    A("Quellen: Open-Meteo (Modelle), GDACS (Europäische Kommission und Vereinte Nationen), NOAA Climate Prediction Center.")
+    A("")
+    return out
+
+
+def fun_facts(X):
+    ch, eu, wo = [], [], []
+    S = [s for s in (X.get("swiss_now") or []) if s.get("T") is not None]
+    if len(S) >= 10:
+        hot, cold = max(S, key=lambda s: s["T"]), min(S, key=lambda s: s["T"])
+        ch.append(f"Gerade jetzt ist {hot['name']} ({int(hot['elev'])} m) mit {deg(hot['T'], 1)} der wärmste und "
+                  f"{cold['name']} ({int(cold['elev'])} m) mit {deg(cold['T'], 1)} der kälteste Messort der Schweiz: "
+                  f"{n(hot['T'] - cold['T'], 1)} K Unterschied.")
+        high = [s for s in S if s["elev"] >= 1500]
+        low = [s for s in S if s["elev"] < 800]
+        if high and low:
+            h, l = max(high, key=lambda s: s["T"]), min(low, key=lambda s: s["T"])
+            if h["T"] > l["T"]:
+                ch.append(f"Verkehrte Welt: Auf {h['name']} ({int(h['elev'])} m) ist es mit {deg(h['T'], 1)} wärmer als "
+                          f"in {l['name']} ({int(l['elev'])} m) mit {deg(l['T'], 1)}, ein klassischer Kaltluftsee.")
+        gs = [s for s in S if s.get("gust") is not None]
+        if gs:
+            g = max(gs, key=lambda s: s["gust"])
+            if g["gust"] >= 40:
+                ch.append(f"Stärkste Böe der letzten zehn Minuten: {g['name']} mit {n(g['gust'])} km/h.")
+        wet = [s for s in S if (s.get("rain") or 0) > 0]
+        ch.append(f"In diesem Moment fällt an {len(wet)} von {len(S)} Stationen Niederschlag."
+                  if wet else f"In diesem Moment ist es an allen {len(S)} Stationen trocken.")
+        rh = [s for s in S if s.get("rh") is not None]
+        if rh:
+            d = min(rh, key=lambda s: s["rh"])
+            if d["rh"] <= 35:
+                ch.append(f"Am trockensten ist die Luft {ort_in(d['name'])} mit {n(d['rh'])} % relativer Feuchte, "
+                          "in den Alpentälern oft ein Föhnzeichen.")
+    r = X["local"]["riederalp"].get(X["days"][0])
+    if r and r.get("fzl_max"):
+        z = r["fzl_max"]
+        if z >= 4478:
+            ch.append(f"Die Nullgradgrenze steigt heute bis {hm(z)} und damit über den Gipfel des Matterhorns (4478 m).")
+        elif z <= 1500:
+            ch.append(f"Die Nullgradgrenze liegt heute höchstens bei {hm(z)}, unter dem Dorf Riederalp.")
+    pk = X.get("peaks") or {}
+    j = X["local"]["jungfraujoch"].get(X["days"][0])
+    ev = pk.get("everest")
+    if ev and j:
+        tx = (ev["v"].get("temperature_2m_max") or [None])[0]
+        gx = (ev["v"].get("wind_gusts_10m_max") or [None])[0]
+        if tx is not None:
+            ch.append(f"Auf dem Gipfel des Mount Everest rechnet das Modell heute mit höchstens {deg(tx)}"
+                      + (f" und Böen bis {n(gx)} km/h" if gx is not None else "")
+                      + f", {n(abs(j['tmax'] - tx))} K {'kälter' if tx <= j['tmax'] else 'wärmer'} als auf dem "
+                      "Jungfraujoch.")
+    e = X["eu"].get(X["days"][0]) if X.get("eu") else None
+    if e:
+        if e.get("pmax") and e.get("pmin"):
+            dp = e["pmax"][1] - e["pmin"][1]
+            eu.append(f"Zwischen {e['pmax'][0]} ({n(e['pmax'][1])} hPa) und {e['pmin'][0]} ({n(e['pmin'][1])} hPa) "
+                      f"liegen {n(dp)} hPa, etwa so viel wie zwischen Meeresniveau und {int(round(dp * 8.3, -1))} m Höhe.")
+        if e.get("jet_max"):
+            v = e["jet_max"] * 3.6
+            eu.append(f"Der Strahlstrom über Europa erreicht in rund 10 km Höhe {n(v)} km/h"
+                      + (", schneller als ein TGV im Regelbetrieb (320 km/h)." if v > 320 else "."))
+        if e.get("t850max") and e.get("t850min"):
+            eu.append(f"In etwa 1500 m Höhe ist die Luft über {e['t850max'][0]} um "
+                      f"{n(e['t850max'][1] - e['t850min'][1])} K wärmer als über {e['t850min'][0]}.")
+    mb = pk.get("montblanc")
+    if mb:
+        tx = (mb["v"].get("temperature_2m_max") or [None])[0]
+        if tx is not None:
+            eu.append(f"Gipfel des Mont Blanc (4806 m), höchster Punkt der Alpen: heute höchstens {deg(tx)}.")
+    rows = world_rows(X)
+    if rows:
+        tx = [r_ for r_ in rows if r_["tmax"] is not None]
+        tn = [r_ for r_ in rows if r_["tmin"] is not None]
+        if tx and tn:
+            h, c = max(tx, key=lambda q: q["tmax"]), min(tn, key=lambda q: q["tmin"])
+            wo.append(f"Zwischen {h['name']} ({deg(h['tmax'])}) und {c['name']} ({deg(c['tmin'])}) liegen heute "
+                      f"{n(h['tmax'] - c['tmin'])} K.")
+        dl = [r_ for r_ in rows if r_["day"] is not None]
+        if dl:
+            lo_, hi_ = min(dl, key=lambda q: q["day"]), max(dl, key=lambda q: q["day"])
+            fmt = lambda s: ("keine Sonne (Polarnacht)" if s < 60 else
+                             ("Sonne rund um die Uhr" if s > 86000 else f"{n(s / 3600, 1)} h Tageslicht"))
+            wo.append(f"Längster Tag: {hi_['name']} mit {fmt(hi_['day'])}; kürzester: {lo_['name']} mit {fmt(lo_['day'])}.")
+        gs = [r_ for r_ in rows if r_["gust"] is not None]
+        if gs:
+            g = max(gs, key=lambda q: q["gust"])
+            wo.append(f"Windigster der {len(rows)} Orte: {g['name']} mit Böen bis {n(g['gust'])} km/h.")
+        sn = [r_ for r_ in rows if (r_["snow"] or 0) >= 1]
+        if sn:
+            wo.append("Schnee fällt heute unter anderem in " + join_de([s_["name"] for s_ in sn[:4]]) + ".")
+    G = X.get("gdacs") or []
+    tcs = [g for g in G if g["type"] == "TC"]
+    if tcs:
+        wo.append(f"Aktive tropische Wirbelstürme laut GDACS: {len(tcs)}"
+                  + (f", darunter {tcs[0]['name'] or tcs[0]['desc']}" if (tcs[0]['name'] or tcs[0]['desc']) else "") + ".")
+    E = X.get("enso")
+    if E:
+        v = E[-1][3]
+        wo.append(f"Der zentrale tropische Pazifik (Niño 3.4) ist gerade {n(abs(v), 1)} K "
+                  f"{'wärmer' if v >= 0 else 'kälter'} als die Tropen im Mittel.")
+    return ch, eu, wo
+
+
+def fun_section(X):
+    ch, eu, wo = fun_facts(X)
+    if not (ch or eu or wo):
+        return []
+    out = ["## Fun Facts", ""]
+    for title, items in (("Schweiz", ch), ("Europa", eu), ("Welt", wo)):
+        if items:
+            out += [f"### {title}", ""] + [f"- {t}" for t in items] + [""]
+    out += ["Messwerte Schweiz: MeteoSchweiz; übrige Werte: Modellvorhersagen über Open-Meteo, an Gipfeln statistisch "
+            "auf die Gipfelhöhe skaliert und entsprechend unsicher.", ""]
+    return out
+
+
+T2M_STOPS = [(-50, (70, 30, 110)), (-30, (44, 95, 168)), (-10, (110, 175, 220)), (0, (225, 236, 240)),
+             (10, (245, 225, 140)), (20, (243, 165, 80)), (30, (215, 80, 50)), (42, (120, 20, 35))]
+
+
+def map_world(X, geo):
+    rows = world_rows(X)
+    if not rows:
+        return None
+    P = Proj(MAPS["welt"]["bbox"], MAPS["welt"]["W"])
+    g = geo.get("welt", {}) if geo else {}
+    h = [svg_open(P, "eu")]
+    h.append(f'<rect x="0" y="0" width="{P.W}" height="{P.H}" class="ocean"/>')
+    for lat in (-60, -30, 0, 30, 60):
+        y = P.xy(lat, 0)[1]
+        h.append(f'<line x1="0" x2="{P.W}" y1="{y:.1f}" y2="{y:.1f}" class="grat"/>')
+    if g.get("coast"):
+        h.append(f'<path d="{path_d(P, g["coast"], tol=0.7)}" class="coastw"/>')
+    for r in rows:
+        if r["tmax"] is None:
+            continue
+        x, y = P.xy(r["lat"], r["lon"])
+        c = band_color(r["tmax"], T2M_STOPS, 2, 255)[:3]
+        h.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.6" fill="rgb{c}" class="wdot"><title>{html.escape(r["name"])} '
+                 f'{n(r["tmax"])} °C</title></circle>')
+    col = {"Red": "#c0392b", "Orange": "#e67e22", "Green": "#2e8b57"}
+    for e in X.get("gdacs") or []:
+        if e["lat"] is None:
+            continue
+        x, y = P.xy(e["lat"], e["lon"])
+        h.append(f'<rect x="{x - 3.5:.1f}" y="{y - 3.5:.1f}" width="7" height="7" transform="rotate(45 {x:.1f} {y:.1f})" '
+                 f'fill="none" stroke="{col.get(e["alert"], "#555")}" stroke-width="1.8"/>')
+    tx = [r for r in rows if r["tmax"] is not None]
+    for r in (max(tx, key=lambda q: q["tmax"]), min(tx, key=lambda q: q["tmax"])):
+        x, y = P.xy(r["lat"], r["lon"])
+        anchor = "end" if x > P.W * 0.7 else "start"
+        dx = -6 if anchor == "end" else 6
+        y = min(max(y, 10), P.H - 6)
+        h.append(f'<text x="{x + dx:.1f}" y="{y + 4:.1f}" class="ilbl" text-anchor="{anchor}">{html.escape(r["name"])} '
+                 f'{n(r["tmax"])}°</text>')
+    x, y = P.xy(LOCAL["riederalp"]["lat"], LOCAL["riederalp"]["lon"])
+    h.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.6" class="rmark"/></svg>')
+    leg = legend_html([(f"background:rgb{band_color(t, T2M_STOPS, 2, 255)[:3]};border-radius:50%", f"{n(t)}")
+                       for t in (-40, -20, 0, 10, 20, 30, 40)] + [("", "°C Höchstwert")]
+                      + [(f"border:2px solid {c};transform:rotate(45deg);width:8px;height:8px;background:none", lab)
+                         for c, lab in (("#c0392b", "GDACS Rot"), ("#e67e22", "Orange"), ("#2e8b57", "Grün"))])
+    cap = ("Höchstwerte heute an den Orten des Kapitels (Ortszeit, Modellvorhersage) und aktive Naturgefahren laut GDACS "
+           "(Rauten: Wirbelstürme, Überschwemmungen, Dürren, Waldbrände). Punkt mit rotem Rand: Riederalp. "
+           "Küstenlinien: Natural Earth.")
+    return map_widget("wo", P, [("Heute", "".join(h))], legend=leg), cap
+
+
+def short_summary(X, insights_list):
+    d0 = X["days"][0]
+    LD = X["local"]["riederalp"]
+    parts = []
+    for d, lab in ((d0, "Heute"), (X["days"][1], "Morgen")):
+        s = LD.get(d)
+        if s:
+            parts.append(f"{lab}: {sky_word(s)}, {n(s['tmin'])} bis {n(s['tmax'])} °C"
+                         + (f", {n(s['prec'], 1)} mm" if s["prec"] >= 0.3 else "")
+                         + (f", {n(s['snow'])} cm Neuschnee" if s["snow"] >= 1 else ""))
+    return "Riederalp " + "; ".join(parts) + ".\n" + "\n".join(f"• {t}" for t in insights_list[:3])
+
+
+def push_ntfy(text):
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic:
+        return
+    if dt.datetime.now(TZ).hour >= 12 and not os.environ.get("NTFY_ALWAYS"):
+        return
+    headers = {"Title": "Wetter Riederalp", "Tags": "mountain"}
+    if os.environ.get("REPORT_URL"):
+        headers["Click"] = os.environ["REPORT_URL"]
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{urllib.parse.quote(topic)}", data=text.encode("utf-8"),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=20):
+            pass
+    except (urllib.error.URLError, TimeoutError) as e:
+        log(f"Push-Nachricht ({e})")
+
+
 # ================================================================ Karten
 NE_BASE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/"
 NE_LAYERS = [("coast", "ne_50m_coastline", ("europa",)),
+             ("coast", "ne_110m_coastline", ("welt",)),
              ("borders", "ne_50m_admin_0_boundary_lines_land", ("europa",)),
              ("borders", "ne_10m_admin_0_boundary_lines_land", ("schweiz", "wallis", "riederalp")),
              ("lakes", "ne_10m_lakes", ("schweiz", "wallis", "riederalp")),
@@ -2995,9 +3477,10 @@ class Proj:
 
 def fetch_bytes(url, timeout=60):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+            raw = r.read()
+            return gzip.decompress(raw) if (r.headers.get("Content-Encoding") or "").lower() == "gzip" else raw
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise ApiError(f"{url.split('/')[2]}: {e}")
 
@@ -3083,7 +3566,7 @@ def geom_parts(g):
 
 
 def load_geo(cache_dir):
-    path = os.path.join(cache_dir, "geo_naturalearth_v1.json")
+    path = os.path.join(cache_dir, "geo_naturalearth_v2.json")
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
@@ -3102,7 +3585,7 @@ def load_geo(cache_dir):
             continue
         for m in maps:
             la0, la1, lo0, lo1 = MAPS[m]["bbox"]
-            pad = 2.0 if m == "europa" else 0.15
+            pad = {"europa": 2.0, "welt": 0.0}.get(m, 0.15)
             for f in data.get("features", []):
                 for part in geom_parts(f.get("geometry")):
                     if part and any(lo0 - pad <= q[0] <= lo1 + pad and la0 - pad <= q[1] <= la1 + pad for q in part):
@@ -3147,12 +3630,13 @@ def tile_frac(lat, lon, z):
 def dem_from_tiles(P, z):
     fx0, fy0 = tile_frac(P.la1, P.lo0, z)
     fx1, fy1 = tile_frac(P.la0, P.lo1, z)
-    tiles = {}
-    for tx in range(int(fx0), int(fx1) + 1):
-        for ty in range(int(fy0), int(fy1) + 1):
-            w, h, bpp, px = png_decode(fetch_bytes(TILE_URL.format(z=z, x=tx, y=ty)))
-            tiles[(tx, ty)] = (w, h, [px[i] * 256 + px[i + 1] + px[i + 2] / 256 - 32768
-                                      for i in range(0, len(px), bpp)])
+    keys = [(tx, ty) for tx in range(int(fx0), int(fx1) + 1) for ty in range(int(fy0), int(fy1) + 1)]
+
+    def load(k):
+        w, h, bpp, px = png_decode(fetch_bytes(TILE_URL.format(z=z, x=k[0], y=k[1])))
+        return w, h, [px[i] * 256 + px[i + 1] + px[i + 2] / 256 - 32768 for i in range(0, len(px), bpp)]
+
+    tiles = dict(zip(keys, pmap(load, keys, workers=6)))
     fys = [tile_frac(P.ll(0, j + 0.5)[0], P.lo0, z)[1] for j in range(P.H)]
     fxs = [tile_frac(P.la0, P.ll(i + 0.5, 0)[1], z)[0] for i in range(P.W)]
     dem = []
@@ -3271,6 +3755,22 @@ def relief_uri(dem, P, vex):
 
 TINT_STOPS = [(200, (178, 198, 160)), (900, (192, 204, 165)), (1600, (214, 204, 168)), (2300, (206, 186, 158)),
               (3000, (178, 168, 160)), (4200, (160, 160, 168))]
+
+
+CACHE_DIR = None
+
+
+def relief_cached(name, dem, P, vex):
+    """Das Relief hängt nur vom Höhenmodell ab: einmal rechnen, danach aus dem Cache."""
+    path = os.path.join(CACHE_DIR, f"relief_{name}_v3.txt") if CACHE_DIR else None
+    if path and os.path.exists(path):
+        with open(path, encoding="ascii") as f:
+            return f.read()
+    uri = relief_uri(dem, P, vex)
+    if path:
+        with open(path, "w", encoding="ascii") as f:
+            f.write(uri)
+    return uri
 
 
 def snow_uri(dem, P, level):
@@ -3492,7 +3992,7 @@ def scale_bar(P):
 def base_layer(P, geo, name, dem, vex):
     h = [svg_open(P, "base")]
     if dem:
-        h.append(f'<image href="{relief_uri(dem, P, vex)}" x="0" y="0" width="{P.W}" height="{P.H}" '
+        h.append(f'<image href="{relief_cached(name, dem, P, vex)}" x="0" y="0" width="{P.W}" height="{P.H}" '
                  'preserveAspectRatio="none" class="relief"/>')
     g = geo.get(name, {}) if geo else {}
     if g.get("lakes"):
@@ -3530,7 +4030,7 @@ def info_box(lines, P=None, corner="tl"):
 
 
 def map_widget(group, P, panes, base=None, top=None, legend=""):
-    h = ['<div class="mapw">']
+    h = [f'<div class="mapw{" single" if len(panes) == 1 else ""}">']
     for i, (lab, _) in enumerate(panes):
         h.append(f'<input type="radio" name="{group}" id="{group}{i}"{" checked" if i == 0 else ""}>'
                  f'<label for="{group}{i}">{html.escape(lab)}</label>')
@@ -3742,7 +4242,8 @@ def build_maps(D, X, cache_dir):
     for key, fn, args in (("karte_europa", map_europe, (D, X, geo)),
                           ("karte_schweiz", map_swiss, (D, X, geo, cache_dir)),
                           ("karte_wallis", map_wallis, (D, X, geo, cache_dir)),
-                          ("karte_ried", map_ried, (D, X, geo, cache_dir))):
+                          ("karte_ried", map_ried, (D, X, geo, cache_dir)),
+                          ("karte_welt", map_world, (X, geo))):
         print(f"Zeichne {key} …", file=sys.stderr)
         try:
             res = fn(*args)
@@ -3899,6 +4400,7 @@ footer{margin-top:3rem;color:var(--muted);font-size:.9rem}
 .mapw>label{display:inline-block;font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;font-size:.92rem;
 padding:.15rem .65rem;margin:0 .3rem .5rem 0;border:1px solid var(--rule);border-radius:999px;cursor:pointer;color:var(--muted)}
 .mapw>input:checked+label{background:var(--ice);border-color:var(--ice);color:var(--sheet)}
+.mapw.single>label{display:none}
 .mapw>input:focus-visible+label{outline:2px solid var(--ice);outline-offset:2px}
 .stack{position:relative;width:100%;border-radius:4px;overflow:hidden;background:var(--paper)}
 .stack>svg,.stack>.panes{position:absolute;inset:0;width:100%;height:100%}
@@ -3937,6 +4439,9 @@ svg .coastd{fill:none;stroke:#26323a;stroke-width:.8}
 svg .borderd{fill:none;stroke:#26323a;stroke-width:.5;stroke-dasharray:2 2;opacity:.8}
 svg .grat{stroke:#26323a;stroke-width:.4;opacity:.25}
 svg .rmark{fill:#fff;stroke:#b0302a;stroke-width:2}
+svg .ocean{fill:var(--water);opacity:.55}
+svg .coastw{fill:none;stroke:var(--ink);stroke-width:.7;opacity:.6}
+svg .wdot{stroke:#1c2328;stroke-width:.6}
 .mlegend{display:flex;flex-wrap:wrap;gap:.25rem .7rem;font-family:"Barlow Semi Condensed","Arial Narrow",Arial,sans-serif;
 font-size:.86rem;color:var(--muted);padding:.55rem .2rem 0}
 .mlegend span{display:inline-flex;align-items:center;gap:.3rem}
@@ -3966,7 +4471,7 @@ def render_html(md, charts, X):
 <body>
 <main>
 {body}
-<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Messwerte: Quelle MeteoSchweiz. Lawinenbulletin: SLF (slf.ch). Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
+<footer>Daten: Open-Meteo.com (CC BY 4.0) mit Modellen von MeteoSchweiz, ECMWF, DWD, NOAA, Météo-France und ItaliaMeteo; ERA5-Land und CAMS (Copernicus). Messwerte: Quelle MeteoSchweiz. Lawinenbulletin: SLF (slf.ch). Naturgefahren: GDACS. ENSO: NOAA CPC. Kartengrundlagen: Natural Earth; Relief: Terrain Tiles (Mapzen, AWS Open Data). Kein offizieller Bericht von MeteoSchweiz.</footer>
 </main>
 </body>
 </html>"""
@@ -4024,6 +4529,9 @@ def main():
     ap.add_argument("--days", type=int, default=7, help="Anzahl Tage inkl. heute (3–10)")
     ap.add_argument("--claude", action="store_true", help="synoptische Einordnung über die Claude API")
     args = ap.parse_args()
+    global CACHE_DIR
+    CACHE_DIR = args.cache
+    os.makedirs(args.cache, exist_ok=True)
     now = dt.datetime.now(TZ)
     days = [now.date() + dt.timedelta(i) for i in range(max(3, min(10, args.days)))]
     D = collect(days, args.cache)
@@ -4049,6 +4557,10 @@ def main():
     diag = {k: v for k, v in X.items() if k not in ("ens_hourly", "det_hourly")}
     with open(os.path.join(args.out, "diagnostik.json"), "w", encoding="utf-8") as f:
         json.dump(to_jsonable(diag), f, ensure_ascii=False, indent=1)
+    kurz = short_summary(X, insights(X))
+    with open(os.path.join(args.out, "kurz.txt"), "w", encoding="utf-8") as f:
+        f.write(kurz + "\n")
+    push_ntfy(kurz)
     print(f"Fertig: {os.path.join(args.out, 'index.html')}", file=sys.stderr)
 
 
