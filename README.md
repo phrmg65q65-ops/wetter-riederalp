@@ -25,6 +25,13 @@ Weitere Teile:
 - **Aletschgletscher:** das Schmelzpotenzial auf 2200, 2700 und 3300 m nach dem Gradtagmodell.
 - **Kleinere Ergänzungen:** Rekorde des Kalendertags 1991–2020, Mondphase, Luftqualität und Pollen.
 
+**Standortmodell:** Die Riederalp liegt auf 1925 m auf einer Hangterrasse über dem Rhonetal, die Modelle sehen sie nur durch ihre Gitterzellen (1 km bei ICON-CH1 bis rund 28 km bei den globalen Ensembles).
+- **Zellhöhe:** Für jedes Modell schätzt der Bericht aus dem Geländemodell die Höhe der verwendeten Zelle und zeigt, wie stark diese von der Riederalp abweicht.
+- **Neuschnee, Schneehöhe und Niederschlag:** Die Schneefallgrenze des Modells wird auf die genaue Ortshöhe angewandt. Der Niederschlag wird bei grosser Höhendifferenz angepasst, der Neuschnee mit temperaturabhängiger Dichte umgerechnet und die Schneehöhe mit einer Schneedecke fortgeschrieben, die setzt und schmilzt (am Südhang schneller). Das gilt für alle Orte und jedes Ensemble-Member.
+- **Rohwerte:** Die Werte der Modelle stehen zum Vergleich daneben.
+- **Sonnenzeiten:** berücksichtigen im Wallis den Horizont aus dem Geländemodell.
+- **Temperatur:** Stationen in ähnlicher Höhenlage zeigen, wie weit die Prognose dort zuletzt danebenlag.
+
 Die Methodik zeigt eine Tabelle aller Datenquellen mit ihrem Status im jeweiligen Lauf. Ein Fehler in einem einzelnen Abschnitt verhindert nie den ganzen Bericht.
 
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.

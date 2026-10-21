@@ -48,7 +48,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.5"
+VERSION = "1.6"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -722,8 +722,9 @@ def ens_day_stats(rec, d, min_hours=20):
     tmax = per_member("temperature_2m", max)
     if len(tmax) < 5:
         return None
-    prec = per_member("precipitation", sum)
-    snow = per_member("snowfall", sum)
+    site = "site_snow" in rec["v"]
+    prec = per_member("site_prec" if site else "precipitation", sum)
+    snow = per_member("site_snow" if site else "snowfall", sum)
     lowm = per_member("cloud_cover_low", lambda v: sum(v) / len(v), sub=lambda h: 7 <= h <= 11, need=3)
     sfh_vals, nmem = [], len(tmax)
     for parr, harr in zip(members(rec, "precipitation"), members(rec, "snowfall_height")):
@@ -743,7 +744,7 @@ def ens_period_snow(rec, days):
     """Neuschneesumme pro Member über den ganzen Berichtszeitraum."""
     ii = [i for d in days for i in rec["idx"].get(d, [])]
     sums = []
-    for arr in members(rec, "snowfall"):
+    for arr in members(rec, "site_snow" if "site_snow" in rec["v"] else "snowfall"):
         vv = [arr[i] for i in ii if i < len(arr)]
         if len(valid(vv)) >= 0.9 * len(ii):
             sums.append(sum(valid(vv)))
@@ -922,6 +923,12 @@ def diagnose(D, days, now):
                     LD[k][d] = s
                     break
     X["local"] = LD
+    try:
+        apply_site_model(D, X)
+        inject_site_ensembles(D)
+        apply_terrain_sun(X)
+    except Exception as e:  # noqa: BLE001 - Standortmodell ist Verfeinerung; ohne bleibt der Rohwert
+        log(f"Standortmodell ({type(e).__name__}: {e})")
     # Ensembles
     E = {}
     for label, mid, parsed in D["ens"]:
@@ -1130,7 +1137,7 @@ def sky_word(s, lowland=False):
 
 def prec_kind(s):
     p, snow = s["prec"], s["snow"]
-    liquid = max(0.0, p - snow / 0.7)
+    liquid = max(0.0, p - s.get("snow_swe", snow / 0.7))
     base = "Schneefall" if (snow >= 1 and liquid < 0.5) else ("Regen und Schnee" if snow >= 1 else "Regen")
     if p < 2:
         return "etwas " + {"Schneefall": "Schnee"}.get(base, base)
@@ -1197,12 +1204,16 @@ def snow_text(s, e, elev, name):
     elif s.get("fzl_mean") is not None:
         out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge nach Faustregel "
                    f"(Nullgradgrenze minus 300 m) um {hm(s['fzl_mean'] - 300)}.")
+    if name == "Riederalp" and s.get("sfh_med") is not None and s["prec"] >= 0.3:
+        out.append("Am Hang: " + ", ".join(f"{LOCAL[k]['name']} ({LOCAL[k]['elev']} m) {phase_word(LOCAL[k]['elev'], s['sfh_med'])}"
+                                           for k in ("moerel", "riederalp", "moosfluh")) + ".")
     ps1 = es.get("psnow1") if es else None
     if s["snow"] >= 0.5 or (ps1 or 0) >= 0.2:
-        t = f"Neuschnee im Hauptlauf {n(s['snow'])} cm (fester Faktor 0,7 cm pro mm Wasserwert)"
-        if s["snow"] >= 0.5 and s.get("t_snow") is not None:
-            t += (f"; mit temperaturabhängiger Neuschneedichte nach Anderson (1976) bei {deg(s['t_snow'])} "
-                  f"eher {n(s['hn_dens'])} cm")
+        t = f"Neuschnee am Standort {n(s['snow'])} cm"
+        if s.get("snow_hi") is not None and s["snow_hi"] - s["snow_lo"] >= 1:
+            t += f" (Bereich {n(s['snow_lo'])} bis {n(s['snow_hi'])} cm je nach Lage der Schneefallgrenze)"
+        if s.get("snow_raw") is not None and abs(s["snow_raw"] - s["snow"]) >= 1:
+            t += f"; die Gitterzelle des Modells allein ergäbe {n(s['snow_raw'])} cm"
         t += "."
         if es and es.get("snow"):
             t += (f" {e[0]}: {pct(es['psnow1'])} für ≥ 1 cm, {pct(es['psnow5'])} für ≥ 5 cm, "
@@ -1212,11 +1223,11 @@ def snow_text(s, e, elev, name):
         out.append("Kein Neuschnee.")
     sd07, sde = s.get("sd07"), s.get("sd_end")
     if (sd07 or 0) < 0.5 and (sde or 0) < 0.5:
-        out.append("Keine Schneedecke im Modell.")
+        out.append("Keine Schneedecke.")
     else:
-        t = f"Modellschneehöhe am Morgen {n(sd07)} cm, am Abend {n(sde)} cm"
-        if es and es.get("sd"):
-            t += f" ({e[0]} am Abend 10–90 %: {n(es['sd']['p10'])} bis {n(es['sd']['p90'])} cm)"
+        t = f"Schneehöhe am Standort am Morgen {n(sd07)} cm, am Abend {n(sde)} cm"
+        if s.get("sd_end_raw") is not None and abs(s["sd_end_raw"] - (sde or 0)) >= 2:
+            t += f" (Gitterzelle des Modells: {n(s['sd_end_raw'])} cm)"
         out.append(t + ".")
     return "**Schnee:** " + " ".join(out)
 
@@ -1386,7 +1397,16 @@ def build_report(X):
             parts.append(f"Der Höchstwert liegt {n(abs(cl['anom_tmax']), 1)} K {word} dem Mittel 1991–2020 "
                          f"({int(round(cl['rank_tmax'] * 100))}. Perzentil).")
         sn = X.get("sun", {}).get(d)
-        if sn and sn.get("rise"):
+        tsun = ((X.get("sun_terrain") or {}).get("riederalp") or {}).get("days", {}).get(d)
+        if tsun and tsun.get("rise"):
+            t = (f"Sonne im Gelände von {tsun['rise']:%H:%M} bis {tsun['set']:%H:%M} Uhr, {n(tsun['hours'], 1)} Stunden "
+                 f"(astronomisch {tsun['astro_rise']:%H:%M} bis {tsun['astro_set']:%H:%M})")
+            if sn and sn.get("uv") is not None:
+                t += f", UV-Index bis {n(sn['uv'])}"
+                if sn["uv"] >= 3 and (s.get("sd_end") or 0) >= 5:
+                    t += "; Schnee reflektiert zusätzlich bis zu 80 % der UV-Strahlung"
+            parts.append(t + ".")
+        elif sn and sn.get("rise"):
             t = f"Sonne astronomisch von {sn['rise']} bis {sn['set']} Uhr (ohne Horizontabschattung)"
             if sn.get("uv") is not None:
                 t += f", UV-Index bis {n(sn['uv'])}"
@@ -1429,7 +1449,7 @@ def build_report(X):
         A("")
         A("Temperatur: Tiefst- / Höchstwert im Hauptlauf, in Klammern 10–90 % des Ensembles für den Höchstwert. "
           "Niederschlag: Tagessumme im Hauptlauf und Wahrscheinlichkeit für mindestens 1 mm. "
-          "Neuschnee: Hauptlauf und Wahrscheinlichkeit für mindestens 5 cm. "
+          "Neuschnee: Standortmodell und Wahrscheinlichkeit für mindestens 5 cm. "
           "Grenzen: Schneefallgrenze bei Niederschlag und mittlere Nullgradgrenze.")
         A("")
         A(trend_text(X))
@@ -1442,6 +1462,7 @@ def build_report(X):
     A("")
     A("<!--CHART:fan-->")
     A("")
+    out.extend(safe_lines(site_section, X))
 
     # ---------- Wallis
     A("## Wallis")
@@ -1764,7 +1785,7 @@ def snow_trend_text(X):
     tot = sum(r["snow"] for _, r in rows)
     parts = []
     if tot >= 0.5:
-        t = f"Neuschnee auf der Riederalp bis {dshort(days[-1])} im Hauptlauf insgesamt {n(tot)} cm"
+        t = f"Neuschnee am Standort Riederalp bis {dshort(days[-1])} insgesamt {n(tot)} cm"
         for lab in ("ECMWF ENS", "NOAA GEFS"):
             sp = X["snow_period"].get(lab)
             if sp:
@@ -1772,10 +1793,10 @@ def snow_trend_text(X):
                 break
         parts.append(t + ".")
     else:
-        parts.append(f"Bis {dshort(days[-1])} im Hauptlauf kein Neuschnee auf der Riederalp.")
+        parts.append(f"Bis {dshort(days[-1])} kein Neuschnee am Standort Riederalp.")
     a, b = rows[0][1].get("sd07"), rows[-1][1].get("sd_end")
     if (a or 0) >= 0.5 or (b or 0) >= 0.5:
-        parts.append(f"Modellschneehöhe von {n(a)} cm heute früh auf {n(b)} cm am {dshort(rows[-1][0])} abends.")
+        parts.append(f"Schneehöhe im Standortmodell von {n(a)} cm heute früh auf {n(b)} cm am {dshort(rows[-1][0])} abends.")
     wet = [(d, r["sfh_med"]) for d, r in rows if r["prec"] >= 0.3 and r.get("sfh_med") is not None]
     if len(wet) >= 2:
         lo, hi = min(wet, key=lambda x: x[1]), max(wet, key=lambda x: x[1])
@@ -1800,8 +1821,9 @@ def snow_table(X):
         last = next((r for r in reversed(rows) if r), None)
         out.append(f"| {LOCAL[k]['name']} | {LOCAL[k]['elev']} m | {n(rows[0].get('sd07'))} cm | {n(two)} cm | "
                    f"{n(tot)} cm | {n(last.get('sd_end') if last else None)} cm |")
-    out += ["", "Neuschnee aus dem Hauptlauf mit festem Faktor 0,7 cm pro mm. Schneehöhen sind Gitterpunktwerte "
-            "des Modells; Messungen des SLF können besonders zu Saisonbeginn und in steilem Gelände stark abweichen.", ""]
+    out += ["", "Neuschnee und Schneehöhe aus dem Standortmodell: Schneefallgrenze der Modelle auf die Ortshöhe "
+            "angewandt, Dichte temperaturabhängig, einfache Schneedecke mit Setzung und Schmelze. Messungen des SLF "
+            "können besonders zu Saisonbeginn, in steilem und windexponiertem Gelände deutlich abweichen.", ""]
     return out
 
 
@@ -2115,7 +2137,7 @@ def insights(X):
     sdays = [d for d, r in rows if r["snow"] >= 1]
     if sdays:
         tot = sum(r["snow"] for _, r in rows)
-        t = f"Neuschnee auf der Riederalp ab {dshort(sdays[0])}, bis {dshort(days[-1])} insgesamt {n(tot)} cm im Hauptlauf"
+        t = f"Neuschnee auf der Riederalp ab {dshort(sdays[0])}, bis {dshort(days[-1])} insgesamt {n(tot)} cm am Standort"
         sp = X["snow_period"].get("ECMWF ENS") or X["snow_period"].get("NOAA GEFS")
         if sp:
             t += f" (Ensemble 10–90 %: {n(sp['p10'])} bis {n(sp['p90'])} cm)"
@@ -2123,7 +2145,7 @@ def insights(X):
     if rows and (rows[0][1].get("sd07") or 0) < 1:
         onset = next(((d, r["sd_end"]) for d, r in rows if (r.get("sd_end") or 0) >= 5), None)
         if onset:
-            I.append((7, f"Eine Schneedecke bildet sich: Modellschneehöhe Riederalp am {dshort(onset[0])} abends "
+            I.append((7, f"Eine Schneedecke bildet sich: Schneehöhe am Standort Riederalp am {dshort(onset[0])} abends "
                          f"{n(onset[1])} cm."))
     wet = [(d, r["sfh_med"]) for d, r in rows if r["prec"] >= 0.3 and r.get("sfh_med") is not None]
     if len(wet) >= 2:
@@ -2372,6 +2394,14 @@ def method_section(X):
       "nur aktive Ereignisse. ENSO: wöchentliche relative Niño-3.4-Anomalie von NOAA CPC. Schweizweite Messwerte: "
       "aktuelle 10-Minuten-Werte aller SwissMetNet-Stationen (MeteoSchweiz).")
     A("")
+    A("**Gitter und Gelände:** Für jedes Modell schätzt der Bericht die Geländehöhe der verwendeten Gitterzelle aus "
+      "dem Geländemodell (Terrain Tiles, bei Ausfall Open-Meteo-Höhenmodell) und bildet die Zellwahl von Open-Meteo "
+      "nach. Schnee, Schneehöhe und Niederschlag an allen Orten stammen aus dem Standortmodell (siehe Kapitel Riederalp, "
+      "Standort und Modellauflösung); Rohwerte der Modelle stehen zum Vergleich daneben. Sonnenzeiten im Wallis "
+      "berücksichtigen den Horizont aus dem Geländemodell. Gitterweiten: ICON-CH1 1 km, ICON-CH2 2,1 km, AROME 1,3 km, "
+      "ICON-D2 und ICON-2I 2,2 km, ICON-EU 7 km, IFS 9 km, ECMWF- und GFS-Ensembles, AIFS sowie Druckflächen 0,25°, "
+      "ERA5-Land 0,1°, CAMS 0,1°, GloFAS 0,05°.")
+    A("")
     A("**MeteoSchweiz-Vergleich:** offizielle Lokalprognose (Open Data, Quelle: MeteoSchweiz) für den Postleitzahlpunkt "
       "Riederalp 3987 und Messstationen, Tageswerte in Lokalzeit; Wettertexte nach dem Piktogrammverzeichnis von "
       "MeteoSchweiz. **Abfluss:** GloFAS (Copernicus Emergency Management Service) über Open-Meteo, Klimatologie aus der "
@@ -2521,8 +2551,8 @@ def svg_snow(X):
     p.append("</svg>")
     ens = f", hellblaues Band {X['ens_sfh'][0]} 10–90 %" if X.get("ens_sfh") else ""
     cap = ("Schneefallgrenze über der Riederalp (blau, kräftig während Niederschlag" + ens +
-           ") und Nullgradgrenze (braun gestrichelt), Höhen in m. Säulen: Neuschnee pro Tag im Hauptlauf in cm; "
-           "Zahlen darunter: Modellschneehöhe am Abend in cm.")
+           ") und Nullgradgrenze (braun gestrichelt), Höhen in m; gepunktete Linien: Mörel, Riederalp, Moosfluh. "
+           "Säulen: Neuschnee pro Tag am Standort in cm; Zahlen darunter: Schneehöhe am Abend im Standortmodell.")
     return "\n".join(p), cap
 
 
@@ -2812,6 +2842,12 @@ def verify(O):
                   "far": fa / (hits + fa) if hits + fa else None,
                   "tn_low": es([x for x in r["tn"] if x[1] < 1200]),
                   "tn_high": es([x for x in r["tn"] if x[1] >= 2000])}
+    # Analogstationen in ähnlicher Höhenlage wie die Riederalp (1300–2400 m)
+    def band_stats(lst):
+        e = [x[0] for x in lst if 1300 <= x[1] <= 2400]
+        return {"bias": sum(e) / len(e), "mae": sum(abs(x) for x in e) / len(e), "n": len(e)} if e else None
+    out["band"] = {"names": [s_["name"] for s_ in O["stations"] if 1300 <= s_["elev"] <= 2400],
+                   "tx": band_stats(R[1]["tx"]), "tn": band_stats(R[1]["tn"])}
     # Nowcast: aktueller Lauf heute gegen stündliche Messungen
     errs = []
     for s in O["stations"]:
@@ -3935,6 +3971,456 @@ def save_model_ids(cache_dir):
             json.dump(MODEL_IDS, f)
     except OSError:
         pass
+
+
+# ================================================================ Standortmodell: Gitter, Gelände, Schnee
+# Gitterweite pro Open-Meteo-Modell: (km bei unstrukturierten/projizierten Gittern, Grad bei regulären Gittern)
+GRID = {"meteoswiss_icon_ch1": (1.0, None), "meteoswiss_icon_ch2": (2.1, None), "meteoswiss_icon_seamless": (1.0, None),
+        "icon_d2": (2.2, None), "dwd_icon_d2": (2.2, None), "icon_eu": (7.0, None), "dwd_icon_eu": (7.0, None),
+        "italia_meteo_arpae_icon_2i": (2.2, None), "meteofrance_arome_france_hd": (1.3, None),
+        "meteofrance_arome_france": (2.5, None), "ecmwf_ifs": (9.0, None), "icon_global": (13.0, None),
+        "ecmwf_ifs025": (None, 0.25), "ecmwf_ifs025_ensemble": (None, 0.25), "ecmwf_aifs025_single": (None, 0.25),
+        "ecmwf_aifs025": (None, 0.25), "gfs_seamless": (None, 0.25), "gfs_global": (None, 0.25), "gfs025": (None, 0.25),
+        "ncep_gefs025": (None, 0.25), "era5_land": (None, 0.1), "era5": (None, 0.25)}
+PRECIP_GRAD = 0.05   # Annahme: +5 % Niederschlag pro 100 m Höhe
+SNOW_TRANS = 300.0   # Übergangszone Regen/Schnee um die Schneefallgrenze (m)
+DDF_SNOW = 3.5       # Gradtagfaktor Schnee, ebene Lage (mm pro K und Tag)
+_DEMS = {}
+_CELLS = {}
+
+
+class DemGrid:
+    def __init__(self, name):
+        cfg = MAPS[name]
+        self.P = Proj(cfg["bbox"], cfg["W"])
+        self.dem, _src = load_dem(name, CACHE_DIR) if CACHE_DIR else (None, None)
+        self.px_km = (self.P.la1 - self.P.la0) / self.P.H * 111.2
+
+    def at(self, lat, lon):
+        if not self.dem:
+            return None
+        x, y = self.P.xy(lat, lon)
+        i, j = int(x), int(y)
+        return self.dem[j][i] if (0 <= j < self.P.H and 0 <= i < self.P.W) else None
+
+    def box(self, la0, la1, lo0, lo1):
+        """Mittel, Minimum, Maximum und Abdeckung des Geländes in einem Rechteck."""
+        if not self.dem:
+            return None
+        x0, y0 = self.P.xy(la1, lo0)
+        x1, y1 = self.P.xy(la0, lo1)
+        ia, ib = max(0, int(math.floor(x0))), min(self.P.W, int(math.ceil(x1)))
+        ja, jb = max(0, int(math.floor(y0))), min(self.P.H, int(math.ceil(y1)))
+        full = max(1.0, (x1 - x0) * (y1 - y0))
+        vals = [self.dem[j][i] for j in range(ja, jb) for i in range(ia, ib)]
+        if not vals:
+            return None
+        return sum(vals) / len(vals), min(vals), max(vals), min(1.0, len(vals) / full)
+
+
+def dems():
+    if not _DEMS:
+        for name in ("riederalp", "wallis", "schweiz"):
+            try:
+                _DEMS[name] = DemGrid(name)
+            except Exception as e:  # noqa: BLE001 - Gelände ist Zusatz, darf nie abbrechen
+                log(f"Geländemodell {name} ({type(e).__name__})")
+    return _DEMS
+
+
+def model_cell(lat, lon, z_site, mid):
+    """Geschätzte Geländehöhe der Modellzelle, die Open-Meteo für den Ort verwendet.
+
+    Open-Meteo wählt standardmässig unter den benachbarten Zellen jene mit der Höhe, die dem Ort am nächsten
+    kommt (cell_selection=land). Nachgebildet mit 3×3 Zellen; Zellhöhe = Mittel des Geländemodells."""
+    spec = GRID.get(mid)
+    if not spec:
+        return None
+    key = (round(lat, 4), round(lon, 4), mid)
+    if key in _CELLS:
+        return _CELLS[key]
+    km, deg_ = spec
+    if deg_:
+        clat, clon, dlat, dlon = round(lat / deg_) * deg_, round(lon / deg_) * deg_, deg_, deg_
+        size_km = deg_ * 111.2
+    else:
+        clat, clon, dlat, dlon = lat, lon, km / 111.2, km / (111.2 * math.cos(math.radians(lat)))
+        size_km = km
+    order = ("riederalp", "wallis", "schweiz") if size_km <= 3 else (("wallis", "schweiz") if size_km <= 12 else ("schweiz",))
+    res = None
+    for name in order:
+        g = dems().get(name)
+        if not g or not g.dem or g.px_km > size_km * 0.6:
+            continue
+        cells = []
+        for a in (-1, 0, 1):
+            for b in (-1, 0, 1):
+                la, lo = clat + a * dlat, clon + b * dlon
+                bx = g.box(la - dlat / 2, la + dlat / 2, lo - dlon / 2, lo + dlon / 2)
+                if bx and bx[3] >= 0.7:
+                    cells.append((bx, a, b))
+        if not cells:
+            continue
+        best = min(cells, key=lambda c: abs(c[0][0] - z_site))
+        center = next((c for c in cells if c[1] == 0 and c[2] == 0), best)
+        res = {"km": size_km, "z": best[0][0], "zmin": best[0][1], "zmax": best[0][2], "z_center": center[0][0],
+               "z_range": (min(c[0][0] for c in cells), max(c[0][0] for c in cells)), "dem": name}
+        break
+    _CELLS[key] = res
+    return res
+
+
+def precip_factor(z_site, cell):
+    if not cell or abs(z_site - cell["z"]) < 150:
+        return 1.0
+    return min(1.4, max(0.7, 1 + PRECIP_GRAD * (z_site - cell["z"]) / 100))
+
+
+def terrain_site(lat, lon):
+    g = dems().get("riederalp")
+    if not g or not g.dem or g.at(lat, lon) is None:
+        g = dems().get("wallis")
+    if not g or not g.dem or g.at(lat, lon) is None:
+        return None
+    z0 = g.at(lat, lon)
+    dx = 0.25 / (111.2 * math.cos(math.radians(lat)))  # ±250 m
+    dy = 0.25 / 111.2
+    ze, zw, zn, zs = g.at(lat, lon + dx), g.at(lat, lon - dx), g.at(lat + dy, lon), g.at(lat - dy, lon)
+    if None in (ze, zw, zn, zs):
+        return {"z": z0}
+    gx, gy = (ze - zw) / 500.0, (zn - zs) / 500.0
+    slope = math.degrees(math.atan(math.hypot(gx, gy)))
+    aspect = (math.degrees(math.atan2(-gx, -gy)) % 360) if slope > 1 else None  # Richtung des Gefälles
+    near = g.box(lat - 0.003, lat + 0.003, lon - 0.0045, lon + 0.0045)
+    wide = g.box(lat - 0.018, lat + 0.018, lon - 0.026, lon + 0.026)
+    return {"z": z0, "slope": slope, "aspect": aspect, "near": near, "wide": wide}
+
+
+def horizon(lat0, lon0, z0):
+    """Horizontwinkel in 5°-Schritten aus dem Geländemodell (Nahbereich fein, Fernbereich bis 40 km grob)."""
+    fine, coarse = dems().get("riederalp"), dems().get("wallis")
+    if not coarse or not coarse.dem:
+        return None
+    kx = 111200 * math.cos(math.radians(lat0))
+    out = []
+    for k in range(72):
+        az = math.radians(k * 5)
+        sa, ca = math.sin(az), math.cos(az)
+        best, dist = 0.0, 60.0
+        while dist <= 40000:
+            la, lo = lat0 + dist * ca / 111200, lon0 + dist * sa / kx
+            z = fine.at(la, lo) if (fine and fine.dem and dist < 9000) else None
+            if z is None:
+                z = coarse.at(la, lo)
+            if z is None:
+                break
+            ang = math.degrees(math.atan((z - z0 - 0.87 * dist * dist / (2 * 6371000)) / dist))
+            best = max(best, ang)
+            dist += 40 if dist < 1500 else (120 if dist < 8000 else 350)
+        out.append(best)
+    return out
+
+
+def sun_pos(t, lat, lon):
+    n_ = t.timestamp() / 86400 + 2440587.5 - 2451545.0
+    L = math.radians((280.460 + 0.9856474 * n_) % 360)
+    g = math.radians((357.528 + 0.9856003 * n_) % 360)
+    lam = L + math.radians(1.915) * math.sin(g) + math.radians(0.020) * math.sin(2 * g)
+    eps = math.radians(23.439 - 4e-7 * n_)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    ha = math.radians((280.46061837 + 360.98564736629 * n_ + lon) % 360) - ra
+    la = math.radians(lat)
+    el = math.asin(math.sin(la) * math.sin(dec) + math.cos(la) * math.cos(dec) * math.cos(ha))
+    az = math.atan2(-math.sin(ha), math.tan(dec) * math.cos(la) - math.sin(la) * math.cos(ha))
+    return math.degrees(el), math.degrees(az) % 360
+
+
+def terrain_sun(lat, lon, hor, d):
+    t = dt.datetime.combine(d, dt.time(3, 0), tzinfo=TZ)
+    vis, astro = [], []
+    while t.hour < 22:
+        el, az = sun_pos(t, lat, lon)
+        if el > -0.83:
+            astro.append(t)
+            h = hor[int(round(az / 5)) % 72] if hor else 0
+            if el > h:
+                vis.append(t)
+        t += dt.timedelta(minutes=5)
+    if not astro:
+        return None
+    return {"rise": vis[0] if vis else None, "set": vis[-1] if vis else None, "hours": len(vis) / 12,
+            "astro_rise": astro[0], "astro_set": astro[-1], "astro_hours": len(astro) / 12}
+
+
+def snow_fraction(z, sfl):
+    return min(1.0, max(0.0, 0.5 + (z - sfl) / SNOW_TRANS))
+
+
+def site_snow(T, P, SFL, FZL, z, fac, sd0=None, ddf=DDF_SNOW, pack=False):
+    """Neuschnee am Standort aus Niederschlag und Schneefallgrenze; optional einfache Schneedecke."""
+    hn, lo, hi, swe_in, pc = [], [], [], [], []
+    for k in range(len(P)):
+        p, t = P[k], T[k] if k < len(T) else None
+        if p is None or t is None:
+            hn.append(None)
+            lo.append(None)
+            hi.append(None)
+            swe_in.append(0.0)
+            pc.append(None)
+            continue
+        p *= fac
+        pc.append(p)
+        sfl = SFL[k] if (SFL and k < len(SFL) and SFL[k] is not None) else None
+        if sfl is None and FZL and k < len(FZL) and FZL[k] is not None:
+            sfl = FZL[k] - 300
+        if sfl is not None:
+            f = snow_fraction(z, sfl)
+            f_lo = snow_fraction(z, sfl + 100)
+            f_hi = snow_fraction(z, sfl - 100 - min(200.0, 70.0 * p))
+        else:
+            f = min(1.0, max(0.0, (1.5 - t) / 2.0))
+            f_lo, f_hi = min(1.0, max(0.0, (1.0 - t) / 2.0)), min(1.0, max(0.0, (2.0 - t) / 2.0))
+        rho = new_snow_density(t)
+        hn.append(p * f / rho * 100)
+        lo.append(p * f_lo / rho * 100)
+        hi.append(p * f_hi / rho * 100)
+        swe_in.append(p * f)
+    res = {"hn": hn, "lo": lo, "hi": hi, "prec": pc}
+    if pack:
+        swe = (sd0 or 0.0) / 100 * 250.0
+        rho_b = 250.0
+        depth = []
+        for k in range(len(P)):
+            t = T[k] if k < len(T) else None
+            if hn[k] is not None and swe_in[k] > 0:
+                rho_new = new_snow_density(t if t is not None else 0.0)
+                vol = (swe / rho_b if swe > 0 else 0.0) + swe_in[k] / rho_new
+                swe += swe_in[k]
+                rho_b = swe / vol if vol > 0 else rho_new
+            if t is not None and t > 0 and swe > 0:
+                swe = max(0.0, swe - ddf / 24 * t)
+            rho_b += (350.0 - rho_b) * (1 - math.exp(-1 / 120))
+            depth.append(swe / rho_b * 100 if swe > 0 else 0.0)
+        res["depth"] = depth
+    return res
+
+
+def member_arrays(rec, var):
+    pat = re.compile(r"^" + re.escape(var) + r"(?:_member(\d+))?$")
+    out = {}
+    for k, arr in rec["v"].items():
+        m = pat.match(k)
+        if m:
+            out[int(m.group(1) or 0)] = arr
+    return out
+
+
+def inject_site_ensembles(D):
+    """Standortmodell für jedes Ensemble-Member: virtuelle Variablen site_snow und site_prec."""
+    for label, mid, parsed in D.get("ens") or []:
+        for loc, rec in parsed.items():
+            L = LOCAL[loc]
+            fac = precip_factor(L["elev"], model_cell(L["lat"], L["lon"], L["elev"], mid))
+            P, T = member_arrays(rec, "precipitation"), member_arrays(rec, "temperature_2m")
+            S = member_arrays(rec, "snowfall_height")
+            for i, parr in P.items():
+                r = site_snow(T.get(i) or [], parr, S.get(i), None, L["elev"], fac)
+                suf = "" if i == 0 else f"_member{i:02d}"
+                rec["v"]["site_snow" + suf] = r["hn"]
+                rec["v"]["site_prec" + suf] = r["prec"]
+
+
+def apply_site_model(D, X):
+    """Standortmodell auf alle Orte anwenden; überschreibt Neuschnee, Schneehöhe und Niederschlag der Tagesübersicht."""
+    labels = {lab: mid for lab, mid, _p in D.get("primary") or []}
+    X["site"] = {}
+    for loc, L in LOCAL.items():
+        S = merged_series(D, loc, ["temperature_2m", "precipitation", "snowfall", "snowfall_height",
+                                   "freezing_level_height", "snow_depth"])
+        if not S or not S["t"]:
+            continue
+        cells = {}
+        for lab, mid in labels.items():
+            if mid == "meteoswiss_icon_seamless":
+                cells[lab] = (model_cell(L["lat"], L["lon"], L["elev"], "meteoswiss_icon_ch1"),
+                              model_cell(L["lat"], L["lon"], L["elev"], "meteoswiss_icon_ch2"))
+            else:
+                c = model_cell(L["lat"], L["lon"], L["elev"], mid)
+                cells[lab] = (c, c)
+        t0 = S["t"][0]
+        facs = []
+        for k, src in enumerate(S["src"]):
+            c = cells.get(src, (None, None))
+            lead_h = (S["t"][k] - t0).total_seconds() / 3600
+            facs.append(precip_factor(L["elev"], c[0] if lead_h < 33 else c[1]))
+        P = [(p * f) if p is not None else None for p, f in zip(S["precipitation"], facs)]
+        sd0 = next((x * 100 for x in S["snow_depth"] if x is not None), 0.0)
+        ts = terrain_site(L["lat"], L["lon"]) if loc in ("riederalp", "moosfluh", "moerel") else None
+        ddf = DDF_SNOW
+        if ts and ts.get("aspect") is not None and ts["slope"] >= 5:
+            a = ts["aspect"]
+            ddf *= 1.3 if 112.5 <= a <= 247.5 else (0.75 if (a >= 292.5 or a <= 67.5) else 1.0)
+        r = site_snow(S["temperature_2m"], P, S["snowfall_height"], S["freezing_level_height"], L["elev"], 1.0,
+                      sd0=sd0, ddf=ddf, pack=True)
+        X["site"][loc] = {"cells": {lab: c[0] for lab, c in cells.items()}, "ddf": ddf, "terrain": ts}
+        idx = {}
+        for k, t in enumerate(S["t"]):
+            idx.setdefault(t.date(), []).append(k)
+        for d, s in X["local"][loc].items():
+            ii = idx.get(d, [])
+            if len(ii) < 20:
+                continue
+            s["snow_raw"], s["prec_raw"] = s["snow"], s["prec"]
+            s["sd07_raw"], s["sd_end_raw"] = s.get("sd07"), s.get("sd_end")
+            hv = valid([r["hn"][k] for k in ii])
+            s["snow"] = sum(hv)
+            s["snow_lo"] = sum(valid([r["lo"][k] for k in ii]))
+            s["snow_hi"] = sum(valid([r["hi"][k] for k in ii]))
+            s["snow_swe"] = sum(valid([(r["prec"][k] or 0) * snow_fraction(L["elev"], S["snowfall_height"][k])
+                                       if S["snowfall_height"][k] is not None else 0 for k in ii]))
+            pv = valid([P[k] for k in ii])
+            s["prec"] = sum(pv) if pv else s["prec"]
+            s["prec_fac"] = sum(facs[k] for k in ii) / len(ii)
+            k07 = next((k for k in ii if S["t"][k].hour == 7), None)
+            s["sd07"] = r["depth"][k07] if k07 is not None else None
+            s["sd_end"] = r["depth"][ii[-1]]
+
+
+def apply_terrain_sun(X):
+    X["sun_terrain"] = {}
+    g = dems().get("wallis")
+    if not g or not g.dem:
+        return
+    for loc, L in LOCAL.items():
+        z0 = g.at(L["lat"], L["lon"])
+        if z0 is None:
+            continue
+        fine = dems().get("riederalp")
+        zf = fine.at(L["lat"], L["lon"]) if (fine and fine.dem) else None
+        hor = horizon(L["lat"], L["lon"], max(L["elev"], zf if zf is not None else z0) + 2)
+        if not hor:
+            continue
+        X["sun_terrain"][loc] = {"hor": hor, "days": {}}
+        for d in X["days"]:
+            ts = terrain_sun(L["lat"], L["lon"], hor, d)
+            if ts:
+                X["sun_terrain"][loc]["days"][d] = ts
+                s = X["local"][loc].get(d)
+                if s and ts["hours"] > 0.5:
+                    s["daylen"] = ts["hours"]
+                    if s.get("sun_h") is not None:
+                        s["sun_h"] = min(s["sun_h"], ts["hours"])
+
+
+def phase_word(z, sfl):
+    f = snow_fraction(z, sfl)
+    return "Schnee" if f >= 0.8 else ("Schneeregen" if f >= 0.2 else "Regen")
+
+
+def site_section(X):
+    site = (X.get("site") or {}).get("riederalp")
+    if not site:
+        return []
+    L = LOCAL["riederalp"]
+    out = ["### Standort und Modellauflösung", ""]
+    A = out.append
+    ts = site.get("terrain")
+    bits = []
+    if ts:
+        t = f"Das Geländemodell zeigt am Standort {int(round(ts['z']))} m"
+        if ts.get("slope") is not None:
+            t += f", eine Neigung von {n(ts['slope'])}° im Umkreis von 250 m"
+            if ts.get("aspect") is not None:
+                t += f" mit Gefälle nach {dname(ts['aspect'], True)}"
+        if ts.get("near") and ts.get("wide"):
+            t += (f"; im Umkreis von 300 m liegt das Gelände zwischen {int(ts['near'][1])} und {int(ts['near'][2])} m, "
+                  f"im Umkreis von 2 km zwischen {int(ts['wide'][1])} und {int(ts['wide'][2])} m")
+        bits.append(t + ".")
+        flat = ts.get("near") and ts["near"][2] - ts["near"][1] < 120
+        bits.append(("Die Riederalp liegt damit auf einer flachen Hangterrasse" if flat else "Die Riederalp liegt am Hang")
+                    + f", rund {L['elev'] - LOCAL['moerel']['elev']} m über dem Rhonetal bei Mörel und unter dem Grat "
+                    "von Moosfluh und Riederhorn. Nachts liegt sie oft in der warmen Hangzone über dem Kaltluftsee, auf "
+                    "der Terrasse selbst kann sich bei klarer Nacht aber eine flache Kaltluftschicht bilden.")
+    st = (X.get("sun_terrain") or {}).get("riederalp")
+    if st and st["days"].get(X["days"][0]):
+        s0 = st["days"][X["days"][0]]
+        hor = st["hor"]
+        q = lambda a, b: max(hor[int(a / 5):int(b / 5) + 1])
+        if s0["rise"]:
+            bits.append(f"Heute steht die Sonne im Gelände von {s0['rise']:%H:%M} bis {s0['set']:%H:%M} Uhr über dem "
+                        f"Horizont, {n(s0['hours'], 1)} von astronomisch {n(s0['astro_hours'], 1)} Stunden; der Horizont "
+                        f"liegt im Osten bei bis zu {n(q(45, 135))}°, im Süden bei {n(q(135, 225))}°, im Westen bei "
+                        f"{n(q(225, 315))}°.")
+    A(" ".join(bits))
+    A("")
+    if ts and abs(ts["z"] - L["elev"]) > 100:
+        A(f"Hinweis: Das Geländemodell weicht am hinterlegten Punkt um {sgn(ts['z'] - L['elev'], 0)} m von 1925 m ab; "
+          "die Koordinate oder die Auflösung des Geländemodells prüfen.")
+        A("")
+    rows = []
+    for lab, mid in (X.get("runs") or {}).items():
+        if mid not in GRID or lab.startswith(("Druckflächen", "Europakarte", "Schweizkarte", "Verifikation",
+                                              "Prognosekonstanz", "UV", "Welt", "Gipfel", "Aletsch", "Abfluss")):
+            continue
+        if mid == "meteoswiss_icon_seamless":
+            continue
+        c = model_cell(L["lat"], L["lon"], L["elev"], mid)
+        if c:
+            rows.append((mid, re.sub(r" \(.*\)$", "", lab), c))
+    for mid, lab in (("meteoswiss_icon_ch1", "ICON-CH1"), ("meteoswiss_icon_ch2", "ICON-CH2"),
+                     ("era5_land", "ERA5-Land (Klimatologie)")):
+        c = model_cell(L["lat"], L["lon"], L["elev"], mid)
+        if c:
+            rows.append((mid, lab, c))
+    groups = {}
+    for mid, lab, c in rows:
+        g = groups.setdefault(mid, [[], c])
+        if lab not in g[0]:
+            g[0].append(lab)
+    if groups:
+        A("| Modell | Gitter | Zellhöhe | Abweichung | Gelände in der Zelle | Niederschlag × |")
+        A("|---|---|---|---|---|---|")
+        for mid, (labs, c) in sorted(groups.items(), key=lambda kv: kv[1][1]["km"]):
+            A(f"| {', '.join(labs)} | {n(c['km'], 1 if c['km'] < 10 else 0)} km | {int(round(c['z'], -1))} m | "
+              f"{sgn(L['elev'] - c['z'], 0)} m | {int(round(c['zmin'], -1))}–{int(round(c['zmax'], -1))} m | "
+              f"{n(precip_factor(L['elev'], c), 2)} |")
+        A("")
+        A("Zellhöhe: Mittel des Geländemodells über die Zelle, die Open-Meteo unter den Nachbarzellen nach passender Höhe "
+          "auswählt; Abweichung: Riederalp minus Zellhöhe. Je gröber das Gitter, desto mehr mischt eine Zelle Talboden, "
+          "Terrasse und Gipfel; ein Modell mit 25 km Gitter kennt weder das Rhonetal noch die Terrasse.")
+        A("")
+    B = ((X.get("verif") or {}).get("band") or {})
+    if B.get("tx") and B.get("tn") and B["tx"]["n"] >= 10:
+        nm_ = [re.sub(r"^(.*?), (.*)$", r"\1 (\2)", x) for x in B["names"][:5]]
+        t = (f"Temperatur an Stationen in ähnlicher Höhenlage ({join_de(nm_)}): Der Folgetag lag in den "
+             f"letzten 14 Tagen beim Höchstwert im Mittel {sgn(B['tx']['bias'])} K und beim Tiefstwert "
+             f"{sgn(B['tn']['bias'])} K neben der Messung.")
+        if (abs(B["tx"]["bias"]) >= 0.5 or abs(B["tn"]["bias"]) >= 0.5) and max(abs(B["tx"]["bias"]),
+                                                                               abs(B["tn"]["bias"])) <= 5:
+            cor = []
+            for d in X["days"][:2]:
+                s_ = X["local"]["riederalp"].get(d)
+                if s_:
+                    cor.append(f"{'heute' if d == X['days'][0] else 'morgen'} {n(s_['tmin'] - B['tn']['bias'])} / "
+                               f"{n(s_['tmax'] - B['tx']['bias'])} °C statt {n(s_['tmin'])} / {n(s_['tmax'])} °C")
+            if cor:
+                t += (" Um diesen Fehler bereinigt ergäbe sich für die Riederalp " + join_de(cor) + ". Die Korrektur "
+                      "beruht auf wenigen Tagen und anderen Hängen; sie zeigt die Richtung, nicht den genauen Wert.")
+        A(t)
+        A("")
+    A("**Was der Bericht deshalb korrigiert:** Temperaturen rechnet Open-Meteo mit −0,65 K pro 100 m auf 1925 m um. "
+      "Für Schnee nutzt der Bericht ein Standortmodell: Die Schneefallgrenze des Modells wird auf die genaue Ortshöhe "
+      "angewandt (Übergang Regen–Schnee über 300 m), der Niederschlag bei mehr als 150 m Höhendifferenz mit 5 % pro "
+      "100 m angepasst, der Neuschnee mit temperaturabhängiger Dichte umgerechnet und die Schneehöhe mit einer einfachen "
+      "Schneedecke fortgeschrieben, die setzt und schmilzt"
+      + (f" (Schmelzfaktor {n(site['ddf'], 1)} mm pro K und Tag, erhöht für den Südhang)" if site["ddf"] > DDF_SNOW else "")
+      + ". Dasselbe Standortmodell läuft für jedes Ensemble-Member. Der Bereich beim Neuschnee zeigt eine um 100 m "
+      "höhere beziehungsweise tiefere Schneefallgrenze, bei kräftigem Niederschlag zusätzlich bis 200 m tiefer "
+      "(Schmelzkühlung, Hangaufwind). Grenzen: Bei Inversion kann die Terrasse nachts wärmer sein als die Umrechnung "
+      "annimmt; Verfrachtung durch Wind und die Strahlung am Südhang bildet das Modell nur grob ab.")
+    A("")
+    return out
 
 
 # ================================================================ Karten
