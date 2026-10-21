@@ -32,6 +32,8 @@ Weitere Teile:
 - **Sonnenzeiten:** berücksichtigen im Wallis den Horizont aus dem Geländemodell.
 - **Temperatur:** Stationen in ähnlicher Höhenlage zeigen, wie weit die Prognose dort zuletzt danebenlag.
 
+**Regen oder Schnee:** Schnee zählt nur, wenn die Schneefallgrenze des Modells und die Feuchttemperatur am Ort beide Schnee zulassen. Bei Lufttemperaturen über +0,5 °C bleibt ein abnehmender Teil liegen, ab +2 °C keiner. Für die bereits vergangenen Stunden des Tages nimmt das Standortmodell die gemessenen Temperaturen der Stationen in der Region. Erwartet MeteoSchweiz für denselben Tag nur Regen, warnt der Bericht, und die Push-Nachricht nennt einen Bereich statt einer festen Zahl.
+
 Die Methodik zeigt eine Tabelle aller Datenquellen mit ihrem Status im jeweiligen Lauf. Ein Fehler in einem einzelnen Abschnitt verhindert nie den ganzen Bericht.
 
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.

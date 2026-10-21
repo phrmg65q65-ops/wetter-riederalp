@@ -48,7 +48,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.6"
+VERSION = "1.6.1"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -1175,7 +1175,7 @@ def melt_cooling(s):
     return gap if gap >= 500 else None
 
 
-def snow_text(s, e, elev, name):
+def snow_text(s, e, elev, name, code=None):
     es = e[1] if e else None
     out = []
     if s["prec"] >= 0.3 and s.get("sfh_med") is not None:
@@ -1221,6 +1221,14 @@ def snow_text(s, e, elev, name):
         out.append(t)
     else:
         out.append("Kein Neuschnee.")
+    if s.get("obs_hours"):
+        out.append(f"Für die Stunden bis {s['obs_until']:%H} Uhr rechnet das Standortmodell mit den gemessenen "
+                   f"Temperaturen der Stationen in der Region, auf {elev} m interpoliert (im Mittel {deg(s['obs_tmean'], 1)}).")
+    if code in RAIN_CODES and s["snow"] >= 1:
+        out.append(f"Achtung: MeteoSchweiz erwartet für die {name} an diesem Tag nur Regen ({picto(code)}); die "
+                   "Schneemenge ist deshalb besonders unsicher und eher zu hoch.")
+    elif code in SNOW_CODES and s["snow"] < 0.5 and s["prec"] >= 2:
+        out.append(f"MeteoSchweiz erwartet für die {name} dagegen Schnee ({picto(code)}).")
     sd07, sde = s.get("sd07"), s.get("sd_end")
     if (sd07 or 0) < 0.5 and (sde or 0) < 0.5:
         out.append("Keine Schneedecke.")
@@ -1378,7 +1386,7 @@ def build_report(X):
         parts.append(fzl_sentence(s))
         A(" ".join(p for p in parts if p))
         A("")
-        A(snow_text(s, e, LOCAL["riederalp"]["elev"], "Riederalp"))
+        A(snow_text(s, e, LOCAL["riederalp"]["elev"], "Riederalp", mch_code(X, "riederalp", d)))
         A("")
         parts = [inv_text(X["inv"].get(d, {}), s, LD["moerel"].get(d))]
         j = LD["jungfraujoch"].get(d)
@@ -2185,6 +2193,13 @@ def insights(X):
         if w["label"] == "Woche 2" and w["p_warm"] is not None and (w["p_warm"] >= 0.8 or w["p_warm"] <= 0.2):
             I.append((5, f"Tendenz {dshort(w['from'])} bis {dshort(w['to'])}: mit {pct(max(w['p_warm'], 1 - w['p_warm']))} "
                          f"{'wärmer' if w['p_warm'] >= 0.5 else 'kälter'} als 1991–2020 (Median {sgn(w['an']['p50'])} K)."))
+    for d in days[:2]:
+        r_ = LD["riederalp"].get(d)
+        if r_ and r_["snow"] >= 3 and mch_code(X, "riederalp", d) in RAIN_CODES:
+            I.append((7, f"Unsicher: Das Standortmodell rechnet {'heute' if d == days[0] else 'morgen'} mit "
+                         f"{n(r_['snow_lo'])} bis {n(r_['snow_hi'])} cm Neuschnee auf der Riederalp, MeteoSchweiz erwartet "
+                         f"nur Regen ({picto(mch_code(X, 'riederalp', d))})."))
+            break
     M = ((X.get("mch") or {}).get("data") or {}).get("riederalp") or {}
     for d in days[:2]:
         s = LD["riederalp"].get(d)
@@ -3545,7 +3560,10 @@ def short_summary(X, insights_list):
         if s:
             parts.append(f"{lab}: {sky_word(s)}, {n(s['tmin'])} bis {n(s['tmax'])} °C"
                          + (f", {n(s['prec'], 1)} mm" if s["prec"] >= 0.3 else "")
-                         + (f", {n(s['snow'])} cm Neuschnee" if s["snow"] >= 1 else ""))
+                         + ((f", Neuschnee {n(s['snow_lo'])} bis {n(s['snow_hi'])} cm" if s.get("snow_hi") is not None
+                             else f", {n(s['snow'])} cm Neuschnee") if s["snow"] >= 1 else "")
+                         + (" (MeteoSchweiz: nur Regen)" if s["snow"] >= 1 and mch_code(X, "riederalp", d) in RAIN_CODES
+                            else ""))
     return "Riederalp " + "; ".join(parts) + ".\n" + "\n".join(f"• {t}" for t in insights_list[:3])
 
 
@@ -4157,8 +4175,39 @@ def snow_fraction(z, sfl):
     return min(1.0, max(0.0, 0.5 + (z - sfl) / SNOW_TRANS))
 
 
-def site_snow(T, P, SFL, FZL, z, fac, sd0=None, ddf=DDF_SNOW, pack=False):
-    """Neuschnee am Standort aus Niederschlag und Schneefallgrenze; optional einfache Schneedecke."""
+def wet_bulb(t, rh):
+    """Feuchttemperatur nach Stull (2011); ohne Feuchte wird Sättigung angenommen (Tw = T, eher Regen)."""
+    if rh is None:
+        return t
+    rh = min(99.0, max(5.0, rh))
+    return (t * math.atan(0.151977 * (rh + 8.313659) ** 0.5) + math.atan(t + rh) - math.atan(rh - 1.676331)
+            + 0.00391838 * rh ** 1.5 * math.atan(0.023101 * rh) - 4.686035)
+
+
+def tw_fraction(tw, shift=0.0):
+    """Schneeanteil aus der Feuchttemperatur: bis 0 °C Schnee, ab 1,5 °C Regen (shift verschiebt die Schwelle)."""
+    return min(1.0, max(0.0, (1.5 + shift - tw) / 1.5))
+
+
+def accum_eff(t):
+    """Anteil des Schnees, der liegen bleibt: über +0,5 °C schmilzt er zunehmend beim Aufprall, ab +2 °C ganz."""
+    return 1.0 if t <= 0.5 else max(0.0, 1.0 - (t - 0.5) / 1.5)
+
+
+def plausible_sfl(sfl, fzl):
+    """Schneefallgrenze verwerfen, wenn sie physikalisch nicht zur Nullgradgrenze passt (Datenfehler, Fehlwert)."""
+    if sfl is None:
+        return None
+    if fzl is not None and not (fzl - 1200 <= sfl <= fzl + 150):
+        return None
+    return sfl
+
+
+def site_snow(T, P, SFL, FZL, z, fac, sd0=None, ddf=DDF_SNOW, pack=False, RH=None):
+    """Neuschnee am Standort aus Niederschlag, Schneefallgrenze und Feuchttemperatur; optional einfache Schneedecke.
+
+    Phase: Schnee nur, wenn sowohl die Schneefallgrenze als auch die Feuchttemperatur am Ort es zulassen.
+    Liegenbleiben: bei Lufttemperaturen über +0,5 °C schmilzt ein zunehmender Teil sofort."""
     hn, lo, hi, swe_in, pc = [], [], [], [], []
     for k in range(len(P)):
         p, t = P[k], T[k] if k < len(T) else None
@@ -4171,22 +4220,25 @@ def site_snow(T, P, SFL, FZL, z, fac, sd0=None, ddf=DDF_SNOW, pack=False):
             continue
         p *= fac
         pc.append(p)
-        sfl = SFL[k] if (SFL and k < len(SFL) and SFL[k] is not None) else None
-        if sfl is None and FZL and k < len(FZL) and FZL[k] is not None:
-            sfl = FZL[k] - 300
+        fzl = FZL[k] if (FZL and k < len(FZL)) else None
+        sfl = plausible_sfl(SFL[k] if (SFL and k < len(SFL)) else None, fzl)
+        if sfl is None and fzl is not None:
+            sfl = fzl - 200
+        tw = wet_bulb(t, RH[k] if (RH and k < len(RH)) else None)
+        ft, ft_lo, ft_hi = tw_fraction(tw), tw_fraction(tw, -0.5), tw_fraction(tw, 0.5)
         if sfl is not None:
-            f = snow_fraction(z, sfl)
-            f_lo = snow_fraction(z, sfl + 100)
-            f_hi = snow_fraction(z, sfl - 100 - min(200.0, 70.0 * p))
+            f = min(snow_fraction(z, sfl), ft)
+            f_lo = min(snow_fraction(z, sfl + 100), ft_lo)
+            f_hi = min(snow_fraction(z, sfl - 100 - min(200.0, 70.0 * p)), ft_hi)
         else:
-            f = min(1.0, max(0.0, (1.5 - t) / 2.0))
-            f_lo, f_hi = min(1.0, max(0.0, (1.0 - t) / 2.0)), min(1.0, max(0.0, (2.0 - t) / 2.0))
+            f, f_lo, f_hi = ft, ft_lo, ft_hi
+        e, e_lo, e_hi = accum_eff(t), accum_eff(t + 0.5), accum_eff(t - 0.5)
         rho = new_snow_density(t)
-        hn.append(p * f / rho * 100)
-        lo.append(p * f_lo / rho * 100)
-        hi.append(p * f_hi / rho * 100)
-        swe_in.append(p * f)
-    res = {"hn": hn, "lo": lo, "hi": hi, "prec": pc}
+        hn.append(p * f * e / rho * 100)
+        lo.append(p * f_lo * e_lo / rho * 100)
+        hi.append(p * f_hi * e_hi / rho * 100)
+        swe_in.append(p * f * e)
+    res = {"hn": hn, "lo": lo, "hi": hi, "prec": pc, "swe": swe_in}
     if pack:
         swe = (sd0 or 0.0) / 100 * 250.0
         rho_b = 250.0
@@ -4231,13 +4283,46 @@ def inject_site_ensembles(D):
                 rec["v"]["site_prec" + suf] = r["prec"]
 
 
+def obs_profile(D):
+    """Gemessene Temperatur als Funktion der Höhe pro Stunde (Stationen im Umkreis der Riederalp)."""
+    O = D.get("obs") or {}
+    st = {s_["abbr"]: s_ for s_ in O.get("stations", [])}
+    by_t = {}
+    for a, o in (O.get("now") or {}).items():
+        if a not in st:
+            continue
+        for t, v in zip(o.get("t", []), o.get("tre200h0") or []):
+            if v is not None:
+                by_t.setdefault(t, []).append((st[a]["elev"], v))
+    prof = {}
+    for t, pts in by_t.items():
+        if len(pts) < 3 or max(p[0] for p in pts) - min(p[0] for p in pts) < 800:
+            continue
+        prof[t] = pts
+    return prof
+
+
+def obs_temp_at(pts, z):
+    """Temperatur auf Höhe z: lineare Anpassung an Stationen im Band ±700 m, sonst an alle."""
+    near = [p for p in pts if abs(p[0] - z) <= 700]
+    use = near if (len(near) >= 2 and max(p[0] for p in near) - min(p[0] for p in near) >= 300) else pts
+    mz = sum(p[0] for p in use) / len(use)
+    mt = sum(p[1] for p in use) / len(use)
+    den = sum((p[0] - mz) ** 2 for p in use)
+    b = sum((p[0] - mz) * (p[1] - mt) for p in use) / den if den > 0 else -0.0065
+    return mt + b * (z - mz)
+
+
 def apply_site_model(D, X):
     """Standortmodell auf alle Orte anwenden; überschreibt Neuschnee, Schneehöhe und Niederschlag der Tagesübersicht."""
     labels = {lab: mid for lab, mid, _p in D.get("primary") or []}
     X["site"] = {}
+    prof = obs_profile(D)
+    now_l = dt.datetime.now(TZ).replace(tzinfo=None)
+    R0 = LOCAL["riederalp"]
     for loc, L in LOCAL.items():
         S = merged_series(D, loc, ["temperature_2m", "precipitation", "snowfall", "snowfall_height",
-                                   "freezing_level_height", "snow_depth"])
+                                   "freezing_level_height", "snow_depth", "relative_humidity_2m"])
         if not S or not S["t"]:
             continue
         cells = {}
@@ -4261,8 +4346,16 @@ def apply_site_model(D, X):
         if ts and ts.get("aspect") is not None and ts["slope"] >= 5:
             a = ts["aspect"]
             ddf *= 1.3 if 112.5 <= a <= 247.5 else (0.75 if (a >= 292.5 or a <= 67.5) else 1.0)
-        r = site_snow(S["temperature_2m"], P, S["snowfall_height"], S["freezing_level_height"], L["elev"], 1.0,
-                      sd0=sd0, ddf=ddf, pack=True)
+        T_eff, obs_k = list(S["temperature_2m"]), set()
+        if prof and km(R0["lat"], R0["lon"], L["lat"], L["lon"]) <= OBS_RADIUS_KM:
+            for k, t in enumerate(S["t"]):
+                if t <= now_l:
+                    pts = prof.get(t.replace(tzinfo=TZ).astimezone(dt.timezone.utc).replace(tzinfo=None))
+                    if pts:
+                        T_eff[k] = obs_temp_at(pts, L["elev"])
+                        obs_k.add(k)
+        r = site_snow(T_eff, P, S["snowfall_height"], S["freezing_level_height"], L["elev"], 1.0,
+                      sd0=sd0, ddf=ddf, pack=True, RH=S["relative_humidity_2m"])
         X["site"][loc] = {"cells": {lab: c[0] for lab, c in cells.items()}, "ddf": ddf, "terrain": ts}
         idx = {}
         for k, t in enumerate(S["t"]):
@@ -4277,8 +4370,12 @@ def apply_site_model(D, X):
             s["snow"] = sum(hv)
             s["snow_lo"] = sum(valid([r["lo"][k] for k in ii]))
             s["snow_hi"] = sum(valid([r["hi"][k] for k in ii]))
-            s["snow_swe"] = sum(valid([(r["prec"][k] or 0) * snow_fraction(L["elev"], S["snowfall_height"][k])
-                                       if S["snowfall_height"][k] is not None else 0 for k in ii]))
+            s["snow_swe"] = sum(r["swe"][k] for k in ii)
+            oh = [k for k in ii if k in obs_k]
+            s["obs_hours"] = len(oh)
+            if oh:
+                s["obs_until"] = S["t"][oh[-1]]
+                s["obs_tmean"] = sum(T_eff[k] for k in oh) / len(oh)
             pv = valid([P[k] for k in ii])
             s["prec"] = sum(pv) if pv else s["prec"]
             s["prec_fac"] = sum(facs[k] for k in ii) / len(ii)
@@ -4311,6 +4408,19 @@ def apply_terrain_sun(X):
                     s["daylen"] = ts["hours"]
                     if s.get("sun_h") is not None:
                         s["sun_h"] = min(s["sun_h"], ts["hours"])
+
+
+RAIN_CODES = {6, 9, 14, 17, 20, 29, 32, 33}       # Piktogramme nur mit Regen
+MIXED_CODES = {7, 10, 15, 18, 21, 31}
+SNOW_CODES = {8, 11, 16, 19, 22, 30, 34, 37, 39, 42}
+
+
+def mch_code(X, loc, d):
+    c = ((((X.get("mch") or {}).get("data") or {}).get(loc) or {}).get("jp2000d0") or {}).get(d)
+    if c is None:
+        return None
+    c = int(c)
+    return c - 100 if c > 100 else c
 
 
 def phase_word(z, sfl):
@@ -4411,7 +4521,7 @@ def site_section(X):
         A("")
     A("**Was der Bericht deshalb korrigiert:** Temperaturen rechnet Open-Meteo mit −0,65 K pro 100 m auf 1925 m um. "
       "Für Schnee nutzt der Bericht ein Standortmodell: Die Schneefallgrenze des Modells wird auf die genaue Ortshöhe "
-      "angewandt (Übergang Regen–Schnee über 300 m), der Niederschlag bei mehr als 150 m Höhendifferenz mit 5 % pro "
+      "angewandt (Übergang Regen–Schnee über 300 m) und zusätzlich mit der Feuchttemperatur am Ort geprüft (Schnee bis 0 °C, Regen ab 1,5 °C; die wärmere Aussage gilt); bei Lufttemperaturen über +0,5 °C bleibt ein abnehmender Teil des Schnees liegen, ab +2 °C keiner. Für die bereits vergangenen Stunden des Tages ersetzen die gemessenen Temperaturen der Stationen in der Region die Modelltemperatur. Der Niederschlag bei mehr als 150 m Höhendifferenz mit 5 % pro "
       "100 m angepasst, der Neuschnee mit temperaturabhängiger Dichte umgerechnet und die Schneehöhe mit einer einfachen "
       "Schneedecke fortgeschrieben, die setzt und schmilzt"
       + (f" (Schmelzfaktor {n(site['ddf'], 1)} mm pro K und Tag, erhöht für den Südhang)" if site["ddf"] > DDF_SNOW else "")
