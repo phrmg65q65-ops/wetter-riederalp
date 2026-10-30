@@ -34,6 +34,14 @@ Weitere Teile:
 
 **Regen oder Schnee:** Schnee zählt nur, wenn die Schneefallgrenze des Modells und die Feuchttemperatur am Ort beide Schnee zulassen. Bei Lufttemperaturen über +0,5 °C bleibt ein abnehmender Teil liegen, ab +2 °C keiner. Für die bereits vergangenen Stunden des Tages nimmt das Standortmodell die gemessenen Temperaturen der Stationen in der Region. Erwartet MeteoSchweiz für denselben Tag nur Regen, warnt der Bericht, und die Push-Nachricht nennt einen Bereich statt einer festen Zahl.
 
+**Unsicherheit:** Für jede wichtige Grösse gibt der Bericht Median und Bereich (10. bis 90. Perzentil) an und dazu, wie genau dieser Bereich selbst bestimmt ist. Das gilt für Tiefst- und Höchstwert, Niederschlag, Neuschnee, Schneefallgrenze, Nullgradgrenze, Böen, Sonnenstunden und Bewölkung.
+- **Multi-Ensemble:** Grundlage sind fünf Ensemble-Systeme mit zusammen rund 160 Membern, jedes gleich gewichtet.
+- **Genauigkeit der Grenzen:** ein zweistufiger Bootstrap über Systeme und Member.
+- **Wahrscheinlichkeiten:** mit der Spanne zwischen den Systemen und einem statistischen Intervall.
+- **Temperatur:** wird zusätzlich an den echten Fehlern der letzten 14 Tage geeicht. Der Faktor k zeigt, wie viel breiter der Bereich sein muss, mit eigenem Intervall; schmaler wird er nie.
+- **Unsicherheitsbudget:** zeigt pro Tag, woher die Unsicherheit stammt (Wetterlage, Uneinigkeit der Modelle, Gitter und Gelände, Eichung) und ab wann die Prognose kaum schärfer ist als die Klimatologie.
+- **Annahmen beim Schnee:** 27 Varianten des Standortmodells zeigen, wie stark meine eigenen Annahmen den Neuschnee verschieben.
+
 Die Methodik zeigt eine Tabelle aller Datenquellen mit ihrem Status im jeweiligen Lauf. Ein Fehler in einem einzelnen Abschnitt verhindert nie den ganzen Bericht.
 
 Unsicherheit ist überall sichtbar: Ensemble-Spannen (10–90 %), Niederschlagswahrscheinlichkeiten, Modellstreuung, Ausreisser, eine Prognosesicherheit pro Tag und die Vorhersagbarkeitsgrenze des aktuellen Laufs. Modelle, die Open-Meteo gerade nicht liefert, werden im Bericht unter «Nicht verfügbar» aufgeführt statt still weggelassen.

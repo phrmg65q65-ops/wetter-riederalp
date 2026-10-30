@@ -38,6 +38,7 @@ import html
 import json
 import math
 import os
+import random
 import re
 import struct
 import sys
@@ -48,7 +49,7 @@ import urllib.request
 import zlib
 from zoneinfo import ZoneInfo
 
-VERSION = "1.6.1"
+VERSION = "1.7"
 TZNAME = "Europe/Zurich"
 TZ = ZoneInfo(TZNAME)
 UA = f"wetterbericht-riederalp/{VERSION} (Python urllib; nicht-kommerziell)"
@@ -99,7 +100,7 @@ LOCAL = {
     "samedan": _p("Samedan", 46.5340, 9.8721, 1709),
 }
 PROFILE = ["moerel", "riederalp", "moosfluh", "jungfraujoch"]
-ENS_LOCS = ["riederalp", "bern", "simplon", "sion"]
+ENS_LOCS = ["riederalp", "moosfluh", "moerel", "sion", "simplon", "zermatt", "bern", "zuerich", "lugano", "genf"]
 CLIM_LOCS = ["riederalp", "sion", "bern", "lugano"]
 
 EU_CITIES = {
@@ -174,7 +175,8 @@ HOURLY_LOCAL = ["temperature_2m", "relative_humidity_2m", "precipitation", "snow
                 "cloud_cover", "cloud_cover_low", "pressure_msl", "wind_speed_10m",
                 "wind_direction_10m", "wind_gusts_10m", "freezing_level_height",
                 "snowfall_height", "sunshine_duration", "cape", "snow_depth"]
-ENS_VARS = ["temperature_2m", "precipitation", "snowfall", "cloud_cover_low", "snowfall_height", "snow_depth"]
+ENS_VARS = ["temperature_2m", "precipitation", "relative_humidity_2m", "snowfall_height", "freezing_level_height",
+            "wind_gusts_10m", "sunshine_duration", "cloud_cover", "cloud_cover_low", "snow_depth"]
 SNOW_TABLE = ["moerel", "simplon", "zermatt", "riederalp", "grimsel", "moosfluh"]  # nach Höhe
 UPPER_MODELS = ["ecmwf_ifs025", "gfs_global", "icon_global"]  # Druckflächen; Ersatzmodelle bei Ausfall
 MODEL_NAMES = {"ecmwf_ifs025": "ECMWF IFS 0,25°", "gfs_global": "NOAA GFS 0,25°", "icon_global": "DWD ICON global",
@@ -670,7 +672,7 @@ def summarize_day(rec, d, lat):
     wet = [k for k, x in enumerate(P) if x is not None and x >= 0.2]
     wdir, wspd = vec_mean(sel(W, day), sel(Wd, day))
     sun = valid(SUN)
-    sfw = valid(sel(SF, wet))
+    sfw = valid([plausible_sfl(SF[k], F[k]) for k in wet])
     snow_k = [k for k, x in enumerate(S) if x is not None and x > 0.05]
     hn_dens, wsum, tsum = 0.0, 0.0, 0.0
     for k in snow_k:
@@ -682,7 +684,7 @@ def summarize_day(rec, d, lat):
     sd07 = at(SD, 7)
     return {
         "sfh_med": quant(sfw, .5) if sfw else None, "sfh_max": max(sfw) if sfw else None,
-        "sfh_day": quant(valid(SF), .5) if valid(SF) else None,
+        "sfh_day": (lambda v: quant(v, .5) if v else None)(valid([plausible_sfl(a, b) for a, b in zip(SF, F)])),
         "hn_dens": hn_dens, "t_snow": tsum / wsum if wsum > 0 else None,
         "sd07": sd07 * 100 if sd07 is not None else None,
         "sd_end": sd_valid[-1] * 100 if sd_valid else None,
@@ -770,6 +772,34 @@ def merged_series(D, loc, variables):
             arr = pick[1]["v"].get(v) if pick else None
             out[v].append(arr[pick[2]] if arr and pick[2] < len(arr) else None)
     return out
+
+
+def ens_hourly_pooled(D, loc="riederalp"):
+    """Stündliche Quantile aus allen Ensembles, jedes verfügbare System gleich gewichtet."""
+    by_t = {}
+    for _lab, _mid, parsed in D.get("ens") or []:
+        rec = parsed.get(loc)
+        if not rec:
+            continue
+        M = members(rec, "temperature_2m")
+        if len(M) < 5:
+            continue
+        for i, t in enumerate(rec["t"]):
+            vals = valid([m[i] for m in M if i < len(m)])
+            if len(vals) >= 5:
+                by_t.setdefault(t, []).append(vals)
+    if not by_t:
+        return None
+    times = sorted(by_t)
+    q = {p_: [] for p_ in (10, 25, 50, 75, 90)}
+    for t in times:
+        vals, w = [], []
+        for g in by_t[t]:
+            vals += g
+            w += [1.0 / (len(by_t[t]) * len(g))] * len(g)
+        for p_ in q:
+            q[p_].append(wquant(vals, w, p_ / 100))
+    return ("Multi-Ensemble", times, q)
 
 
 def ens_hourly_quantiles(rec, var="temperature_2m"):
@@ -934,8 +964,8 @@ def diagnose(D, days, now):
     for label, mid, parsed in D["ens"]:
         E[label] = {loc: {d: ens_day_stats(rec, d) for d in days} for loc, rec in parsed.items()}
     X["ens"] = E
-    X["ens_hourly"] = None
-    for pref in ("ECMWF ENS", "NOAA GEFS", "ECMWF AIFS-ENS"):
+    X["ens_hourly"] = ens_hourly_pooled(D)
+    for pref in (() if X["ens_hourly"] else ("ECMWF ENS", "NOAA GEFS", "ECMWF AIFS-ENS")):
         for label, mid, parsed in D["ens"]:
             if label == pref and "riederalp" in parsed:
                 X["ens_hourly"] = (label, *ens_hourly_quantiles(parsed["riederalp"]))
@@ -1199,11 +1229,14 @@ def snow_text(s, e, elev, name, code=None):
             out.append(f"Die Schneefallgrenze liegt {hm(gap)} unter der Nullgradgrenze, deutlich mehr als die "
                        "üblichen rund 300 m: Schmelzen und Verdunsten im kräftigen Niederschlag kühlen die Luft, "
                        "die Grenze kann dann rascher sinken als die Nullgradgrenze.")
+    elif s["prec"] >= 0.3 and s.get("fzl_mean") is not None:
+        out.append(f"Die Schneefallgrenze des Modells fehlt oder ist unplausibel; nach vorsichtiger Faustregel "
+                   f"(Nullgradgrenze minus 200 m) läge sie um {hm(s['fzl_mean'] - 200)}.")
     elif s.get("sfh_day") is not None:
         out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge im Modell um {hm(s['sfh_day'])}.")
     elif s.get("fzl_mean") is not None:
-        out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge nach Faustregel "
-                   f"(Nullgradgrenze minus 300 m) um {hm(s['fzl_mean'] - 300)}.")
+        out.append(f"Kein nennenswerter Niederschlag; die Schneefallgrenze läge nach vorsichtiger Faustregel "
+                   f"(Nullgradgrenze minus 200 m) um {hm(s['fzl_mean'] - 200)}.")
     if name == "Riederalp" and s.get("sfh_med") is not None and s["prec"] >= 0.3:
         out.append("Am Hang: " + ", ".join(f"{LOCAL[k]['name']} ({LOCAL[k]['elev']} m) {phase_word(LOCAL[k]['elev'], s['sfh_med'])}"
                                            for k in ("moerel", "riederalp", "moosfluh")) + ".")
@@ -1374,20 +1407,22 @@ def build_report(X):
         e = best_ens(X, "riederalp", d)
         es = e[1] if e else None
         sky = sky_word(s)
-        ps = prec_sentence(s, es, sfh=False, snow=False)
+        ps = prec_sentence(s, None, sfh=False, snow=False)
         parts = [f"{cap(sky)}{' und trocken' if not ps else ''}.", ps]
-        tsent = f"Tiefstwert {deg(s['tmin'])}, Höchstwert {deg(s['tmax'])}"
-        if es:
-            tsent += f" ({e[0]} mit {es['n']} Membern, 10–90 %: {ens_range(es)})"
-        parts.append(tsent + ".")
+        parts.append(f"Im Hauptlauf Tiefstwert {deg(s['tmin'])}, Höchstwert {deg(s['tmax'])}.")
+        parts.append(cal_temp_text(X, "riederalp", d))
         wp = wind_phrase(s["gust"], s["wdir"])
         if wp:
             parts.append(cap(wp) + ".")
         parts.append(fzl_sentence(s))
         A(" ".join(p for p in parts if p))
         A("")
-        A(snow_text(s, e, LOCAL["riederalp"]["elev"], "Riederalp", mch_code(X, "riederalp", d)))
+        A(snow_text(s, None, LOCAL["riederalp"]["elev"], "Riederalp", mch_code(X, "riederalp", d)))
         A("")
+        rb = range_paragraph(X, "riederalp", d, s)
+        if rb:
+            A(rb)
+            A("")
         parts = [inv_text(X["inv"].get(d, {}), s, LD["moerel"].get(d))]
         j = LD["jungfraujoch"].get(d)
         if j:
@@ -1445,17 +1480,35 @@ def build_report(X):
             es = e[1] if e else None
             wx = sky_word(s) + (f", {prec_kind(s)}" if s["prec"] >= 0.3 else "")
             tt = f"{n(s['tmin'])} / {n(s['tmax'])} °C"
-            if es and es.get("tmax"):
+            ct = ((X.get("calt") or {}).get("riederalp", {}).get(d) or {}).get("tmax")
+            if ct:
+                tt += f" ({n(ct['lo'])}…{n(ct['hi'])} {fmt_pm(*ct['hi_ci'], 'tmax')})"
+            elif es and es.get("tmax"):
                 tt += f" ({n(es['tmax']['p10'])} bis {n(es['tmax']['p90'])})"
             pr = f"{n(s['prec'], 1)} mm"
-            if es and es.get("p1") is not None:
+            ur = ((X.get("unc") or {}).get("riederalp", {}).get(d) or {})
+            if ur.get("prec"):
+                pr += f" ({n(ur['prec']['q'][0], 1)}…{n(ur['prec']['q'][2], 1)})"
+            pp = (ur.get("p_prec") or {}).get(1.0)
+            if pp:
+                pr += f", {pct(pp['p'])}"
+            elif es and es.get("p1") is not None:
                 pr += f", {pct(es['p1'])}"
             cf = X["conf"].get(d, {}).get("label", "–")
-            hn = f"{n(s['snow'])} cm" + (f", {pct(es['psnow5'])}" if es and es.get("psnow5") is not None else "")
+            hn = f"{n(s['snow'])} cm"
+            if ur.get("snow") and ur["snow"]["q"][2] >= 0.5:
+                hn += f" ({n(ur['snow']['q'][0])}…{n(ur['snow']['q'][2])})"
+            sp5 = (ur.get("p_snow") or {}).get(5.0)
+            if sp5:
+                hn += f", {pct(sp5['p'])}"
+            elif es and es.get("psnow5") is not None:
+                hn += f", {pct(es['psnow5'])}"
             sfg = hm(s["sfh_med"]) if (s["prec"] >= 0.3 and s.get("sfh_med") is not None) else "–"
             A(f"| {dshort(d)} | {wx} | {tt} | {pr} | {hn} | {sfg} / {hm(s['fzl_mean'])} | {cf} |")
         A("")
-        A("Temperatur: Tiefst- / Höchstwert im Hauptlauf, in Klammern 10–90 % des Ensembles für den Höchstwert. "
+        A("Temperatur: Tiefst- / Höchstwert im Hauptlauf, in Klammern der kalibrierte Bereich (10.–90. Perzentil) des "
+          "Höchstwerts und die Unsicherheit seiner Grenzen. Bereiche bei Niederschlag und Neuschnee aus dem "
+          "Multi-Ensemble. "
           "Niederschlag: Tagessumme im Hauptlauf und Wahrscheinlichkeit für mindestens 1 mm. "
           "Neuschnee: Standortmodell und Wahrscheinlichkeit für mindestens 5 cm. "
           "Grenzen: Schneefallgrenze bei Niederschlag und mittlere Nullgradgrenze.")
@@ -1554,6 +1607,7 @@ def build_report(X):
     # ---------- Unsicherheiten
     A("## Unsicherheiten und Modellvergleich")
     A("")
+    out.extend(safe_lines(unc_overview, X))
     out.extend(safe_lines(mch_section, X))
     out.extend(safe_lines(uncertainty_section, X))
 
@@ -1586,8 +1640,12 @@ def glance(X):
 
     row("Wetter", lambda s, d: sky_word(s) + (f", {prec_kind(s)}" if s["prec"] >= 0.3 else ""))
     row("Temperatur", lambda s, d: f"{n(s['tmin'])} / {n(s['tmax'])} °C")
+    row("Bereich Höchstwert", lambda s, d: (lambda c: f"{n(c['lo'])} bis {n(c['hi'])} °C {fmt_pm(*c['hi_ci'], 'tmax')}"
+                                           if c else "–")(((X.get("calt") or {}).get("riederalp", {}).get(d) or {}).get("tmax")))
     row("Niederschlag", lambda s, d: f"{n(s['prec'], 1)} mm" + (f" ({pct(ens(d)['p1'])})" if ens(d).get("p1") is not None else ""))
-    row("Neuschnee", lambda s, d: f"{n(s['snow'])} cm")
+    row("Neuschnee", lambda s, d: f"{n(s['snow'])} cm" + (lambda u: f" ({n(u['q'][0])} bis {n(u['q'][2])})"
+                                                            if u and u["q"][2] >= 0.5 else "")(
+        (((X.get("unc") or {}).get("riederalp", {}).get(d)) or {}).get("snow")))
     row("Schneefall- / 0°-Grenze", lambda s, d: (hm(s["sfh_med"]) if s["prec"] >= 0.3 and s.get("sfh_med") else "–")
         + f" / {hm(s['fzl_mean'])}")
     row("Böen", lambda s, d: f"{n(s['gust'])} km/h" if s.get("gust") is not None else "–")
@@ -1785,6 +1843,36 @@ def trend_text(X):
     return " ".join(parts)
 
 
+def range_paragraph(X, loc, d, s):
+    U = ((X.get("unc") or {}).get(loc) or {}).get(d) or {}
+    if not U:
+        return ""
+    bits = [unc_sentence(X, loc, d, v) for v in ("prec", "snow", "sfh", "fzl", "gust", "sun") if U.get(v)]
+    bits = [b for b in bits if b]
+    pp = (U.get("p_prec") or {}).get(1.0)
+    if pp:
+        bits.append(prob_text(pp, "mindestens 1 mm mit"))
+    sp = (U.get("p_snow") or {}).get(5.0)
+    if sp and sp["p"] > 0:
+        bits.append(prob_text(sp, "mindestens 5 cm Neuschnee mit"))
+    if s.get("snow_param") and s["snow_param"][1] - s["snow_param"][0] >= 1:
+        bits.append(f"die Annahmen des Standortmodells verschieben den Neuschnee im Hauptlauf zwischen "
+                    f"{n(s['snow_param'][0])} und {n(s['snow_param'][1])} cm")
+    if not bits:
+        return ""
+    st = U.get("tmax")
+    return ("**Bereiche (Multi-Ensemble, " + (f"{st['nsys']} Systeme" if st else "alle Systeme") + "):** "
+            + cap("; ".join(bits)) + ".")
+
+
+def tx_range(X, loc, d):
+    c = ((X.get("calt") or {}).get(loc, {}).get(d) or {}).get("tmax")
+    if c:
+        return f"{n(c['lo'])} bis {n(c['hi'])} °C"
+    st = (((X.get("unc") or {}).get(loc, {}).get(d)) or {}).get("tmax")
+    return f"{n(st['q'][0])} bis {n(st['q'][2])} °C" if st else ""
+
+
 def snow_trend_text(X):
     days, LD = X["days"], X["local"]
     rows = [(d, LD["riederalp"].get(d)) for d in days if LD["riederalp"].get(d)]
@@ -1842,8 +1930,10 @@ def wallis_text(X, d):
     parts = []
     if sion:
         ps = prec_sentence(sion, sfh=False, place="in Sion")
+        rs = tx_range(X, "sion", d)
         parts.append(f"Im Rhonetal {sky_word(sion)}{'' if ps else ' und trocken'}. "
-                     f"Höchstwerte {deg(sion['tmax'])} in Sion" + (f" und {deg(visp['tmax'])} in Visp." if visp else "."))
+                     f"Höchstwerte {deg(sion['tmax'])} in Sion" + (f" (Bereich {rs})" if rs else "")
+                     + (f" und {deg(visp['tmax'])} in Visp." if visp else "."))
         if ps:
             parts.append(ps)
     gusts = [(s["gust"], s["wdir"], nm) for s, nm in ((mart, "Martigny"), (sion, "Sion")) if s and s["gust"]]
@@ -1933,6 +2023,9 @@ def swiss_text(X, d):
         if ps:
             t += " " + ps
         t += f" Höchstwerte {n(min(txs))} bis {n(max(txs))} °C."
+        rr = [(LOCAL[k]["name"], tx_range(X, k, d)) for k in ("zuerich", "bern") if tx_range(X, k, d)]
+        if rr:
+            t += " Bereiche: " + "; ".join(f"{a} {b}" for a, b in rr) + "."
         lines.append(t)
     gf = g("genf")
     if gf:
@@ -2213,6 +2306,15 @@ def insights(X):
             I.append((6, f"Abfluss {r['name']}: einzelne Ensemble-Member übersteigen bis {dshort(r['pk_max'][0])} den "
                          f"höchsten Wert dieser Jahreszeit 1991–2020 (GloFAS)."))
             break
+    C0 = ((X.get("calt") or {}).get("riederalp") or {})
+    k1 = (C0.get(days[0]) or {}).get("tmax") or {}
+    if k1.get("calibrated") and k1.get("k", 1) >= 1.5:
+        I.append((5, f"Die Ensembles sind für die Riederalp zu schmal: Laut den Fehlern der letzten 14 Tage muss der "
+                     f"Temperaturbereich etwa {n(k1['k'], 1)}-mal breiter sein (80 %: {n(k1['k_ci'][0], 1)} bis "
+                     f"{n(k1['k_ci'][1], 1)})."))
+    if X.get("skill_horizon") and (X["skill_horizon"] - days[0]).days <= 4:
+        I.append((5, f"Ab {dshort(X['skill_horizon'])} ist die Temperaturprognose für die Riederalp kaum schärfer als "
+                     "die Klimatologie."))
     big = [e for e in (X.get("gdacs") or []) if e["alert"] in ("Red", "Orange")]
     if big:
         e = big[0]
@@ -2409,6 +2511,19 @@ def method_section(X):
       "nur aktive Ereignisse. ENSO: wöchentliche relative Niño-3.4-Anomalie von NOAA CPC. Schweizweite Messwerte: "
       "aktuelle 10-Minuten-Werte aller SwissMetNet-Stationen (MeteoSchweiz).")
     A("")
+    A("**Unsicherheit:** Bereiche (10. bis 90. Perzentil) stammen aus einem Multi-Ensemble aus ICON-CH1-EPS, "
+      "ICON-CH2-EPS, ECMWF ENS, ECMWF AIFS-ENS und NOAA GEFS, jedes System gleich gewichtet; Niederschlag und Schnee "
+      "pro Member aus dem Standortmodell. Die Unsicherheit der Bereichsgrenzen ist die halbe Breite ihres "
+      "80-%-Intervalls aus einem zweistufigen Bootstrap (200 Ziehungen: Systeme mit Zurücklegen, darin Member mit "
+      "Zurücklegen). Wahrscheinlichkeiten: Mittel der Systeme, Spanne zwischen den Systemen und Wilson-Intervall mit "
+      "der effektiven Memberzahl. Temperatur kalibriert: Streuung des Multi-Ensembles plus Höhenumrechnung (2 K/km "
+      "Unsicherheit des Gradienten mal Höhendifferenz der Zellen, für den Tiefstwert auf der Terrasse zusätzlich "
+      "0,6 K), skaliert mit k = Fehlerstreuung der Vortagesprognosen ÷ (√2 · vorhergesagte Streuung), mindestens 1, und um den "
+      "Bias verschoben; k und Bias mit Bootstrap über die Fehler. Vergleich mit der Klimatologie: Streuung des "
+      "Höchstwerts 1991–2020 (ERA5-Land, ±7 Tage). Standortmodell: 27 Varianten (Übergangszone 200/300/400 m, "
+      "Temperaturschwelle ±0,5 K, Niederschlagsgradient 0/5/10 % pro 100 m). Annahmen: Normalverteilung für die "
+      "kalibrierte Temperatur; die Eichung stammt von anderen Stationen und wenigen Tagen.")
+    A("")
     A("**Gitter und Gelände:** Für jedes Modell schätzt der Bericht die Geländehöhe der verwendeten Gitterzelle aus "
       "dem Geländemodell (Terrain Tiles, bei Ausfall Open-Meteo-Höhenmodell) und bildet die Zellwahl von Open-Meteo "
       "nach. Schnee, Schneehöhe und Niederschlag an allen Orten stammen aus dem Standortmodell (siehe Kapitel Riederalp, "
@@ -2424,7 +2539,9 @@ def method_section(X):
       "**Luft und Pollen:** CAMS Europa. **Mond:** Rechnung mit mittlerem synodischem Monat, Genauigkeit etwa ±1 Tag.")
     A("")
     out.extend(status_table())
-    A("**Prognosesicherheit:** u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
+    A("**Prognosesicherheit:** u = 0,6 · min(1, σ/σ_Klima) + 0,4 · (1 − |2p − 1|) mit σ der kalibrierten Streuung "
+      "des Höchstwerts, σ_Klima seiner natürlichen Streuung 1991–2020 und p der Wahrscheinlichkeit für mindestens 1 mm "
+      "(Multi-Ensemble); ohne Ensembles gilt die frühere Formel u = 0,6 · min(1, Spread/6 K) + 0,4 · (1 − |2p − 1|), mit 25 % Anteil der "
       "Modellstreuung; hoch < 0,35, mittel < 0,6, sonst gering. Heuristik, nicht verifiziert.")
     A("")
     if X["log"]:
@@ -2631,9 +2748,13 @@ def svg_fan(X):
         for seg in _segments([a for a, _ in pts], [b for _, b in pts]):
             p.append(f'<polyline points="{" ".join(f"{x:.1f},{Y_(y):.1f}" for x, y in seg)}" class="det{k}"/>')
     ref = X["ens"].get(label, {}).get("riederalp", {})
+    UR = (X.get("unc") or {}).get("riederalp") or {}
     p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{bar_b}" y2="{bar_b}" class="axl"/>')
     for d in days:
         st = ref.get(d)
+        pp = ((UR.get(d) or {}).get("p_prec") or {}).get(1.0)
+        if pp:
+            st = {"p1": pp["p"]}
         if not st or st.get("p1") is None:
             continue
         xa = X_(dt.datetime.combine(d, dt.time(0))) + bw * 0.22
@@ -2861,6 +2982,7 @@ def verify(O):
     def band_stats(lst):
         e = [x[0] for x in lst if 1300 <= x[1] <= 2400]
         return {"bias": sum(e) / len(e), "mae": sum(abs(x) for x in e) / len(e), "n": len(e)} if e else None
+    out["raw"] = {L: {"tx": R[L]["tx"], "tn": R[L]["tn"]} for L in (1, 2, 3)}
     out["band"] = {"names": [s_["name"] for s_ in O["stations"] if 1300 <= s_["elev"] <= 2400],
                    "tx": band_stats(R[1]["tx"]), "tn": band_stats(R[1]["tn"])}
     # Nowcast: aktueller Lauf heute gegen stündliche Messungen
@@ -4088,10 +4210,11 @@ def model_cell(lat, lon, z_site, mid):
     return res
 
 
-def precip_factor(z_site, cell):
+def precip_factor(z_site, cell, grad=None):
     if not cell or abs(z_site - cell["z"]) < 150:
         return 1.0
-    return min(1.4, max(0.7, 1 + PRECIP_GRAD * (z_site - cell["z"]) / 100))
+    g = PRECIP_GRAD if grad is None else grad
+    return min(1.4, max(0.7, 1 + g * (z_site - cell["z"]) / 100))
 
 
 def terrain_site(lat, lon):
@@ -4226,11 +4349,11 @@ def site_snow(T, P, SFL, FZL, z, fac, sd0=None, ddf=DDF_SNOW, pack=False, RH=Non
             sfl = fzl - 200
         tw = wet_bulb(t, RH[k] if (RH and k < len(RH)) else None)
         ft, ft_lo, ft_hi = tw_fraction(tw), tw_fraction(tw, -0.5), tw_fraction(tw, 0.5)
-        if sfl is not None:
+        if sfl is not None and tw > -1.0:
             f = min(snow_fraction(z, sfl), ft)
             f_lo = min(snow_fraction(z, sfl + 100), ft_lo)
             f_hi = min(snow_fraction(z, sfl - 100 - min(200.0, 70.0 * p)), ft_hi)
-        else:
+        else:  # ohne Schneefallgrenze oder bei Feuchttemperatur unter −1 °C entscheidet die Temperatur am Ort
             f, f_lo, f_hi = ft, ft_lo, ft_hi
         e, e_lo, e_hi = accum_eff(t), accum_eff(t + 0.5), accum_eff(t - 0.5)
         rho = new_snow_density(t)
@@ -4275,9 +4398,10 @@ def inject_site_ensembles(D):
             L = LOCAL[loc]
             fac = precip_factor(L["elev"], model_cell(L["lat"], L["lon"], L["elev"], mid))
             P, T = member_arrays(rec, "precipitation"), member_arrays(rec, "temperature_2m")
-            S = member_arrays(rec, "snowfall_height")
+            S, F = member_arrays(rec, "snowfall_height"), member_arrays(rec, "freezing_level_height")
+            H = member_arrays(rec, "relative_humidity_2m")
             for i, parr in P.items():
-                r = site_snow(T.get(i) or [], parr, S.get(i), None, L["elev"], fac)
+                r = site_snow(T.get(i) or [], parr, S.get(i), F.get(i), L["elev"], fac, RH=H.get(i))
                 suf = "" if i == 0 else f"_member{i:02d}"
                 rec["v"]["site_snow" + suf] = r["hn"]
                 rec["v"]["site_prec" + suf] = r["prec"]
@@ -4334,11 +4458,13 @@ def apply_site_model(D, X):
                 c = model_cell(L["lat"], L["lon"], L["elev"], mid)
                 cells[lab] = (c, c)
         t0 = S["t"][0]
-        facs = []
+        fgrad = {g: [] for g in (0.0, 0.05, 0.10)}
         for k, src in enumerate(S["src"]):
             c = cells.get(src, (None, None))
             lead_h = (S["t"][k] - t0).total_seconds() / 3600
-            facs.append(precip_factor(L["elev"], c[0] if lead_h < 33 else c[1]))
+            for g in fgrad:
+                fgrad[g].append(precip_factor(L["elev"], c[0] if lead_h < 33 else c[1], grad=g))
+        facs = fgrad[0.05]
         P = [(p * f) if p is not None else None for p, f in zip(S["precipitation"], facs)]
         sd0 = next((x * 100 for x in S["snow_depth"] if x is not None), 0.0)
         ts = terrain_site(L["lat"], L["lon"]) if loc in ("riederalp", "moosfluh", "moerel") else None
@@ -4356,6 +4482,8 @@ def apply_site_model(D, X):
                         obs_k.add(k)
         r = site_snow(T_eff, P, S["snowfall_height"], S["freezing_level_height"], L["elev"], 1.0,
                       sd0=sd0, ddf=ddf, pack=True, RH=S["relative_humidity_2m"])
+        variants = snow_param_spread(S, S["precipitation"], fgrad, L, T_eff, S["relative_humidity_2m"]) \
+            if loc == "riederalp" else []
         X["site"][loc] = {"cells": {lab: c[0] for lab, c in cells.items()}, "ddf": ddf, "terrain": ts}
         idx = {}
         for k, t in enumerate(S["t"]):
@@ -4371,6 +4499,9 @@ def apply_site_model(D, X):
             s["snow_lo"] = sum(valid([r["lo"][k] for k in ii]))
             s["snow_hi"] = sum(valid([r["hi"][k] for k in ii]))
             s["snow_swe"] = sum(r["swe"][k] for k in ii)
+            if variants:
+                tot = [sum(valid([v[k] for k in ii])) for v in variants]
+                s["snow_param"] = (min(tot), max(tot))
             oh = [k for k in ii if k in obs_k]
             s["obs_hours"] = len(oh)
             if oh:
@@ -4531,6 +4662,546 @@ def site_section(X):
       "annimmt; Verfrachtung durch Wind und die Strahlung am Südhang bildet das Modell nur grob ab.")
     A("")
     return out
+
+
+# ================================================================ Unsicherheit: Bereiche und ihre Unsicherheit
+B_BOOT = 200            # Bootstrap-Ziehungen für die Unsicherheit der Bereichsgrenzen
+Z80 = 1.2816            # P10/P90 einer Normalverteilung
+SIGMA_LAPSE = 2.0       # Unsicherheit des Temperaturgradienten (K/km) für die Höhenumrechnung
+SIGMA_TERRACE_TMIN = 0.6  # Zusatzunsicherheit Tiefstwert auf der Terrasse (Kaltluft/warme Hangzone), Annahme
+UNC_VARS = ("tmax", "tmin", "prec", "snow", "sfh", "fzl", "gust", "sun", "cloud")
+UNC_UNITS = {"tmax": ("°C", 0), "tmin": ("°C", 0), "prec": ("mm", 1), "snow": ("cm", 0), "sfh": ("m", -2),
+             "fzl": ("m", -2), "gust": ("km/h", 0), "sun": ("h", 1), "cloud": ("%", 0)}
+UNC_NAMES = {"tmax": "Höchstwert", "tmin": "Tiefstwert", "prec": "Niederschlag", "snow": "Neuschnee",
+             "sfh": "Schneefallgrenze", "fzl": "Nullgradgrenze", "gust": "Böen", "sun": "Sonnenstunden",
+             "cloud": "Bewölkung"}
+
+
+def wquant(vals, wts, p):
+    pairs = sorted(zip(vals, wts))
+    tot = sum(w for _, w in pairs)
+    if not pairs or tot <= 0:
+        return None
+    c, target = 0.0, p * tot
+    prev_v = pairs[0][0]
+    for v, w in pairs:
+        if c + w >= target:
+            frac_ = (target - c) / w if w > 0 else 0
+            return prev_v + (v - prev_v) * frac_ if c > 0 else v
+        c += w
+        prev_v = v
+    return pairs[-1][0]
+
+
+def member_daily(rec, d, var, loc, X):
+    """Tageswert jedes Members (Liste), Standortmodell für Niederschlag und Schnee."""
+    ii = rec["idx"].get(d, [])
+    if len(ii) < 20:
+        return []
+    hrs = [rec["t"][i].hour for i in ii]
+    base = {"tmax": "temperature_2m", "tmin": "temperature_2m", "gust": "wind_gusts_10m",
+            "fzl": "freezing_level_height", "sun": "sunshine_duration", "cloud": "cloud_cover",
+            "prec": "site_prec" if "site_prec" in rec["v"] else "precipitation",
+            "snow": "site_snow" if "site_snow" in rec["v"] else "snowfall", "sfh": "snowfall_height"}[var]
+    A = member_arrays(rec, base)
+    P = member_arrays(rec, "site_prec" if "site_prec" in rec["v"] else "precipitation") if var == "sfh" else {}
+    FZ = member_arrays(rec, "freezing_level_height") if var == "sfh" else {}
+    cap = ((X.get("sun_terrain") or {}).get(loc) or {}).get("days", {}).get(d, {}).get("hours")
+    out = []
+    for i, arr in A.items():
+        v = [arr[k] if k < len(arr) else None for k in ii]
+        vv = valid(v)
+        if var in ("tmax", "tmin", "gust", "fzl", "prec", "snow") and len(vv) < 20:
+            continue
+        if var == "tmax":
+            out.append(max(vv))
+        elif var == "tmin":
+            out.append(min(vv))
+        elif var == "gust":
+            out.append(max(vv))
+        elif var == "fzl":
+            out.append(sum(vv) / len(vv))
+        elif var in ("prec", "snow"):
+            out.append(sum(vv))
+        elif var == "sun":
+            if len(vv) >= 20:
+                h = sum(vv) / 3600
+                out.append(min(h, cap) if cap else h)
+        elif var == "cloud":
+            dv = valid([x for x, h in zip(v, hrs) if 8 <= h <= 17])
+            if len(dv) >= 6:
+                out.append(sum(dv) / len(dv))
+        elif var == "sfh":
+            p, fz = P.get(i), FZ.get(i) or []
+            if p:
+                wet = valid([plausible_sfl(x, fz[k_] if k_ < len(fz) else None) for k_, x in zip(ii, v)
+                             if k_ < len(p) and p[k_] is not None and p[k_] >= 0.2])
+                if wet:
+                    out.append(quant(wet, .5))
+    return out
+
+
+def pooled_stats(sysvals, rng, boot=B_BOOT):
+    """Gepoolte Quantile mit gleichem Gewicht pro System und zweistufigem Bootstrap (Systeme, Member)."""
+    systems = [(lab, v) for lab, v in sysvals.items() if len(v) >= 5]
+    if not systems:
+        return None
+
+    def wq(sample):
+        vals, w = [], []
+        ns = len(sample)
+        for _lab, v in sample:
+            vals += v
+            w += [1.0 / (ns * len(v))] * len(v)
+        return [wquant(vals, w, p) for p in (0.1, 0.5, 0.9)]
+
+    q = wq(systems)
+    boots = []
+    for _ in range(boot):
+        smp = [systems[rng.randrange(len(systems))] for _ in systems] if len(systems) >= 2 else systems
+        boots.append(wq([(lab, [v[rng.randrange(len(v))] for _ in v]) for lab, v in smp]))
+    ci = [(quant([b[i] for b in boots], .1), quant([b[i] for b in boots], .9)) for i in range(3)]
+    means = [sum(v) / len(v) for _l, v in systems]
+    gm = sum(means) / len(means)
+    within = sum(sum((x - m) ** 2 for x in v) / max(1, len(v) - 1) for (_l, v), m in zip(systems, means)) / len(systems)
+    between = sum((m - gm) ** 2 for m in means) / max(1, len(means) - 1) if len(means) >= 2 else 0.0
+    neff = len(systems) ** 2 / sum(1.0 / len(v) for _l, v in systems)
+    return {"q": q, "ci": ci, "boots": boots, "sys": {lab: (quant(v, .1), quant(v, .5), quant(v, .9), len(v))
+                                                       for lab, v in systems},
+            "within": math.sqrt(within), "between": math.sqrt(between), "neff": neff, "nsys": len(systems)}
+
+
+def wilson(p, n, z=Z80):
+    if n <= 0:
+        return (None, None)
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def prob_stats(sysvals, thr):
+    systems = [(lab, v) for lab, v in sysvals.items() if len(v) >= 5]
+    if not systems:
+        return None
+    ps = {lab: sum(1 for x in v if x >= thr) / len(v) for lab, v in systems}
+    p = sum(ps.values()) / len(ps)
+    neff = len(systems) ** 2 / sum(1.0 / len(v) for _l, v in systems)
+    return {"p": p, "ci": wilson(p, neff), "sys": (min(ps.values()), max(ps.values())), "neff": neff}
+
+
+def sigma_rep(loc, D, var):
+    """Repräsentativität: Höhendifferenz Zelle–Ort mal Unsicherheit des Gradienten, gemittelt über die Systeme."""
+    L = LOCAL[loc]
+    vals = []
+    for _lab, mid, _p in D.get("ens") or []:
+        c = model_cell(L["lat"], L["lon"], L["elev"], mid)
+        if c:
+            vals.append(abs(L["elev"] - c["z"]) / 1000 * SIGMA_LAPSE)
+    s = sum(vals) / len(vals) if vals else 0.3
+    if loc == "riederalp" and var == "tmin":
+        s = math.sqrt(s * s + SIGMA_TERRACE_TMIN ** 2)
+    return s
+
+
+def calibration(O, X):
+    """Bias und Fehlerstreuung des Folgetags (1–3 Tage Vorlauf) an Stationen in ähnlicher Höhenlage, mit Bootstrap."""
+    raw = ((X.get("verif") or {}).get("raw")) or {}
+    rng = random.Random(7)
+    out = {}
+    for L in (1, 2, 3):
+        for var in ("tx", "tn"):
+            errs = [e for e, z in (raw.get(L, {}).get(var) or []) if 1300 <= z <= 2400]
+            if len(errs) < 10:
+                errs = [e for e, z in (raw.get(L, {}).get(var) or [])]
+            if len(errs) < 10:
+                continue
+            def stats(es):
+                m = sum(es) / len(es)
+                return m, math.sqrt(sum((x - m) ** 2 for x in es) / (len(es) - 1))
+            bias, sd = stats(errs)
+            bs = [stats([errs[rng.randrange(len(errs))] for _ in errs]) for _ in range(B_BOOT)]
+            out[(L, var)] = {"bias": bias, "sd": sd, "n": len(errs),
+                             "bias_ci": (quant([b[0] for b in bs], .1), quant([b[0] for b in bs], .9)),
+                             "sd_ci": (quant([b[1] for b in bs], .1), quant([b[1] for b in bs], .9)),
+                             "boot": bs}
+    return out
+
+
+def diagnose_uncertainty(D, X):
+    rng = random.Random(42)
+    days = X["days"]
+    U = {}
+    for loc in ENS_LOCS:
+        U[loc] = {}
+        for d in days:
+            row = {}
+            for var in UNC_VARS:
+                if loc != "riederalp" and var not in ("tmax", "tmin", "prec", "snow", "gust"):
+                    continue
+                sv = {}
+                for lab, _mid, parsed in D.get("ens") or []:
+                    rec = parsed.get(loc)
+                    if rec:
+                        v = member_daily(rec, d, var, loc, X)
+                        if v:
+                            sv[lab] = v
+                st = pooled_stats(sv, rng, boot=B_BOOT if loc == "riederalp" else 80)
+                if st:
+                    row[var] = st
+                    if var == "prec":
+                        row["p_prec"] = {t: prob_stats(sv, t) for t in (1.0, 5.0, 10.0, 20.0)}
+                    if var == "snow":
+                        row["p_snow"] = {t: prob_stats(sv, t) for t in (1.0, 5.0, 10.0, 20.0)}
+            U[loc][d] = row
+    X["unc"] = U
+    cal = calibration(D.get("obs") or {}, X)
+    X["cal"] = cal
+    today = days[0]
+    C = {}
+    for loc in ENS_LOCS:
+        C[loc] = {}
+        for d in days:
+            for var, cv in (("tmax", "tx"), ("tmin", "tn")):
+                st = (U[loc].get(d) or {}).get(var)
+                if not st or st["q"][0] is None:
+                    continue
+                lead = min(3, max(1, (d - today).days))
+                cb = cal.get((lead, cv))
+                s_ens = max(0.05, (st["q"][2] - st["q"][0]) / (2 * Z80))
+                s_rep = sigma_rep(loc, D, var)
+                s_pred = math.sqrt(s_ens ** 2 + s_rep ** 2)
+                k, center, kci = 1.0, st["q"][1], None
+                if cb:
+                    k = min(4.0, max(1.0, cb["sd"] / (math.sqrt(2) * s_pred)))
+                    kb = [min(4.0, max(1.0, b[1] / (math.sqrt(2) * s_pred))) for b in cb["boot"]]
+                    kci = (quant(kb, .1), quant(kb, .9))
+                    if abs(cb["bias"]) <= 5:
+                        center = st["q"][1] - cb["bias"]
+                s_cal = k * s_pred
+                lo, hi = center - Z80 * s_cal, center + Z80 * s_cal
+                # Unsicherheit der kalibrierten Grenzen: Ensemble-Median, Bias und Fehlerstreuung gemeinsam ziehen
+                bl, bh = [], []
+                for j in range(B_BOOT):
+                    q50 = st["boots"][j % len(st["boots"])][1] if st.get("boots") else st["q"][1]
+                    if cb:
+                        b_, sd_ = cb["boot"][j % len(cb["boot"])]
+                        kk = min(4.0, max(1.0, sd_ / (math.sqrt(2) * s_pred)))
+                        cc = q50 - (b_ if abs(cb["bias"]) <= 5 else 0)
+                    else:
+                        kk, cc = 1.0, q50
+                    bl.append(cc - Z80 * kk * s_pred)
+                    bh.append(cc + Z80 * kk * s_pred)
+                cl = clim_window(D.get("clim") or {}, loc, d, "tmax" if var == "tmax" else "tmin") \
+                    if loc in CLIM_LOCS else []
+                s_clim = (math.sqrt(sum((x - sum(cl) / len(cl)) ** 2 for x in cl) / (len(cl) - 1))
+                          if len(cl) >= 100 else None)
+                C[loc].setdefault(d, {})[var] = {
+                    "center": center, "lo": lo, "hi": hi, "lo_ci": (quant(bl, .1), quant(bl, .9)),
+                    "hi_ci": (quant(bh, .1), quant(bh, .9)), "k": k, "k_ci": kci, "bias": cb["bias"] if cb else None,
+                    "s_within": st["within"], "s_between": st["between"], "s_rep": s_rep,
+                    "s_cal_extra": math.sqrt(max(0.0, s_cal ** 2 - s_pred ** 2)), "s_total": s_cal,
+                    "s_clim": s_clim, "lead": lead, "calibrated": cb is not None}
+    X["calt"] = C
+    # Prognosesicherheit aus kalibrierter Streuung relativ zur Klimatologie und Niederschlags-Mehrdeutigkeit
+    for d in days:
+        c = (C.get("riederalp", {}).get(d) or {}).get("tmax")
+        pp = ((U.get("riederalp", {}).get(d) or {}).get("p_prec") or {}).get(1.0)
+        if c and c.get("s_clim"):
+            r = min(1.0, c["s_total"] / c["s_clim"])
+            p1 = pp["p"] if pp else 0.0
+            u = 0.6 * r + 0.4 * (1 - abs(2 * p1 - 1))
+            X.setdefault("conf", {})[d] = {"u": u, "label": "hoch" if u < 0.35 else ("mittel" if u < 0.6 else "gering"),
+                                           "spreadT": 2 * Z80 * c["s_total"], "p1": p1, "ratio": r}
+    hz = None
+    for d in days:
+        c = (C.get("riederalp", {}).get(d) or {}).get("tmax")
+        if c and c["s_clim"] and c["s_total"] / c["s_clim"] >= 0.8:
+            hz = d
+            break
+    X["skill_horizon"] = hz
+
+
+def snow_param_spread(S, P_raw, facs_by_grad, L, T_eff, RH):
+    """Neuschnee mit 27 Varianten der Annahmen des Standortmodells (Übergangszone, Feuchttemperatur, Höhengradient)."""
+    global SNOW_TRANS
+    res = []
+    keep = SNOW_TRANS
+    try:
+        for trans in (200.0, 300.0, 400.0):
+            SNOW_TRANS = trans
+            for grad, facs in facs_by_grad.items():
+                P = [(p * f) if p is not None else None for p, f in zip(P_raw, facs)]
+                for shift in (-0.5, 0.0, 0.5):
+                    TT = [t - shift if t is not None else None for t in T_eff]
+                    r = site_snow(TT, P, S["snowfall_height"], S["freezing_level_height"], L["elev"], 1.0, RH=RH)
+                    res.append(r["hn"])
+    finally:
+        SNOW_TRANS = keep
+    return res
+
+
+def fmt_rng(lo, hi, var):
+    unit, dec = UNC_UNITS[var]
+    if dec < 0:
+        return f"{hm(lo)} bis {hm(hi)}"
+    return f"{n(lo, dec)} bis {n(hi, dec)} {unit}"
+
+
+def fmt_pm(ci_lo, ci_hi, var):
+    """Unsicherheit einer Bereichsgrenze als ±halbe Breite ihres 80-%-Intervalls."""
+    if ci_lo is None or ci_hi is None:
+        return ""
+    unit, dec = UNC_UNITS[var]
+    hw = (ci_hi - ci_lo) / 2
+    if dec < 0:
+        return f"±{int(round(hw / 10.0) * 10)} m"
+    u = "K" if unit == "°C" else unit
+    return f"±{n(hw, max(dec, 1) if hw < 10 else 0)} {u}"
+
+
+def bound_unc(st, var):
+    """Mittlere Unsicherheit der beiden Bereichsgrenzen P10 und P90."""
+    a, b = st["ci"][0], st["ci"][2]
+    if None in (a[0], a[1], b[0], b[1]):
+        return ""
+    return fmt_pm(0, ((a[1] - a[0]) + (b[1] - b[0])) / 2, var)
+
+
+def unc_sentence(X, loc, d, var, label=None):
+    """Ein Satzteil: Median, Bereich P10–P90 und Unsicherheit der Grenzen."""
+    st = ((X.get("unc") or {}).get(loc, {}).get(d) or {}).get(var)
+    if not st or st["q"][1] is None:
+        return ""
+    unit, dec = UNC_UNITS[var]
+    med = hm(st["q"][1]) if dec < 0 else f"{n(st['q'][1], dec)} {unit}"
+    return (f"{label or UNC_NAMES[var]} Median {med}, Bereich {fmt_rng(st['q'][0], st['q'][2], var)}"
+            f" (Grenzen {bound_unc(st, var)})")
+
+
+def prob_text(ps, what):
+    if not ps:
+        return ""
+    lo, hi = ps["ci"]
+    return (f"{what} {pct(ps['p'])} (Systeme {pct(ps['sys'][0])} bis {pct(ps['sys'][1])}, "
+            f"Stichprobe {pct(lo)} bis {pct(hi)})")
+
+
+def cal_temp_text(X, loc, d):
+    c = (X.get("calt") or {}).get(loc, {}).get(d) or {}
+    parts = []
+    for var in ("tmin", "tmax"):
+        cv = c.get(var)
+        if not cv:
+            continue
+        pm_ = (fmt_pm(*cv["lo_ci"], var) if cv["lo_ci"][0] is not None else "")
+        parts.append(f"{UNC_NAMES[var]} {n(cv['center'])} °C, Bereich {n(cv['lo'])} bis {n(cv['hi'])} °C"
+                     + (f" (Grenzen {pm_})" if pm_ else ""))
+    if not parts:
+        return ""
+    cal = any(c.get(v, {}).get("calibrated") for v in ("tmin", "tmax"))
+    txt = ("Kalibriert: " if cal else "Ensemble: ") + "; ".join(parts) + "."
+    s_ = (X.get("local") or {}).get(loc, {}).get(d)
+    out_ = [UNC_NAMES[v] for v, key in (("tmin", "tmin"), ("tmax", "tmax"))
+            if s_ and c.get(v) and not (c[v]["lo"] - 0.5 <= s_[key] <= c[v]["hi"] + 0.5)]
+    if out_:
+        txt += (f" Der Hauptlauf liegt beim {join_de(out_)} ausserhalb dieses Bereichs, er ist hier also ein Ausreisser "
+                "gegenüber den Ensembles.")
+    return txt
+
+
+def unc_overview(X):
+    """Kapitelteil: Bereiche, ihre Unsicherheit, Wahrscheinlichkeiten, Kalibrierung, Budget, Prognosegüte."""
+    U = (X.get("unc") or {}).get("riederalp") or {}
+    if not U:
+        return []
+    days = [d for d in X["days"] if U.get(d)]
+    out = ["### Bereiche und ihre Unsicherheit, Riederalp", "",
+           "Median und Bereich (10. bis 90. Perzentil) aus allen Ensembles, jedes System gleich gewichtet; dahinter die "
+           "Unsicherheit der beiden Bereichsgrenzen als ±halbe Breite ihres 80-%-Intervalls (Bootstrap über Systeme und "
+           "Member). Lesebeispiel: «5 [3…8] ±0,6» heisst, mit 80 % liegt der Wert zwischen 3 und 8, und diese Grenzen "
+           "selbst sind auf etwa 0,6 genau bestimmt.", "",
+           "| Grösse | " + " | ".join(dshort(d) for d in days) + " |", "|---|" + "---|" * len(days)]
+    for var in UNC_VARS:
+        cells = []
+        for d in days:
+            st = U[d].get(var)
+            if not st or st["q"][1] is None:
+                cells.append("–")
+                continue
+            unit, dec = UNC_UNITS[var]
+            f = (lambda x: str(int(round(x, -2)))) if dec < 0 else (lambda x: n(x, dec))
+            if var in ("prec", "snow") and (st["q"][2] or 0) < 0.05:
+                cells.append("0")
+                continue
+            cells.append(f"{f(st['q'][1])} [{f(st['q'][0])}…{f(st['q'][2])}] {bound_unc(st, var)}")
+        unit = UNC_UNITS[var][0]
+        out.append(f"| {UNC_NAMES[var]} ({unit}) | " + " | ".join(cells) + " |")
+    out.append("")
+    # Wahrscheinlichkeiten
+    out += ["**Wahrscheinlichkeiten** (Mittel der Systeme; dahinter Spanne zwischen den Systemen und 80-%-Intervall aus "
+            "der effektiven Memberzahl):", "",
+            "| Tag | ≥ 1 mm | ≥ 10 mm | ≥ 5 cm Neuschnee | ≥ 20 cm Neuschnee |", "|---|---|---|---|---|"]
+    for d in days:
+        pp, sp = U[d].get("p_prec") or {}, U[d].get("p_snow") or {}
+        cell = lambda ps: (("0 %" if ps["p"] == 0 and ps["sys"][1] == 0 else
+                            f"{pct(ps['p'])} ({pct(ps['sys'][0])}…{pct(ps['sys'][1])}; ±{n((ps['ci'][1] - ps['ci'][0]) * 50)} %)")
+                           if ps else "–")
+        out.append(f"| {dshort(d)} | {cell(pp.get(1.0))} | {cell(pp.get(10.0))} | {cell(sp.get(5.0))} | {cell(sp.get(20.0))} |")
+    out.append("")
+    # Kalibrierung
+    C = (X.get("calt") or {}).get("riederalp") or {}
+    if C:
+        out += ["### Kalibrierte Temperaturbereiche", "",
+                "Ensembles sind am Boden und in steilem Gelände meist zu schmal. Deshalb wird der Bereich mit den echten "
+                "Fehlern der letzten 14 Tage an Stationen in ähnlicher Höhenlage geeicht: Bei einem gut kalibrierten "
+                "Ensemble ist der Fehler eines einzelnen Laufs etwa √2-mal so gross wie die Streuung. Der Faktor k sagt, "
+                "um wie viel der Bereich breiter sein muss; dazu kommt die Unsicherheit der Höhenumrechnung von der "
+                "Gitterzelle auf 1925 m.", "",
+                "| Tag | Höchstwert | Tiefstwert | k (80 %) | Bias |", "|---|---|---|---|---|"]
+        for d in days:
+            c = C.get(d) or {}
+            cell = lambda v: (f"{n(v['center'])} [{n(v['lo'])}…{n(v['hi'])}] {fmt_pm(*v['hi_ci'], 'tmax')}" if v else "–")
+            tx, tn = c.get("tmax"), c.get("tmin")
+            kk = tx or tn
+            kt = (f"{n(kk['k'], 1)} ({n(kk['k_ci'][0], 1)}–{n(kk['k_ci'][1], 1)})" if kk and kk.get("k_ci") else
+                  ("1,0 (keine Eichung)" if kk else "–"))
+            bt = sgn(kk["bias"]) + " K" if kk and kk.get("bias") is not None else "–"
+            out.append(f"| {dshort(d)} | {cell(tx)} | {cell(tn)} | {kt} | {bt} |")
+        out.append("")
+        any_cal = any((C.get(d) or {}).get("tmax", {}).get("calibrated") for d in days)
+        if any_cal:
+            k1 = (C.get(days[0]) or {}).get("tmax") or {}
+            if k1.get("k", 1) > 1.2:
+                out.append(f"Das Ensemble ist für die Riederalp zu schmal: Der Bereich muss am ersten Tag etwa "
+                           f"{n(k1['k'], 1)}-mal breiter sein, als die Ensembles allein zeigen. Diese Eichung beruht auf wenigen "
+                           "Tagen und anderen Stationen; ihr eigenes 80-%-Intervall steht in der Spalte k.")
+            else:
+                out.append("Die Ensemble-Streuung deckt die tatsächlichen Fehler der letzten 14 Tage ungefähr ab; der Bereich "
+                           "wird kaum verbreitert. Schmaler macht ihn die Eichung nie: Dafür reichen 14 Tage nicht.")
+        else:
+            out.append("Ohne ausreichende Verifikation (Messwerte nicht verfügbar) bleiben die Bereiche ungeeicht und sind "
+                       "eher zu schmal.")
+        out.append("")
+    # Budget und Prognosegüte
+    out += ["<!--CHART:budget-->", ""]
+    if C:
+        dom = []
+        for d in days:
+            v = (C.get(d) or {}).get("tmax")
+            if not v:
+                continue
+            comp = {"Wetterlage (Streuung in den Systemen)": v["s_within"], "Uneinigkeit der Modelle": v["s_between"],
+                    "Gitter und Gelände": v["s_rep"], "Eichung an Messungen": v["s_cal_extra"]}
+            dom.append((d, max(comp, key=comp.get)))
+        if dom:
+            grp = []
+            for d, w in dom:
+                if grp and grp[-1][2] == w:
+                    grp[-1][1] = d
+                else:
+                    grp.append([d, d, w])
+            out.append("Grösste Quelle der Unsicherheit beim Höchstwert: " + "; ".join(
+                (f"{dshort(a)}" if a == b else f"{dshort(a)} bis {dshort(b)}") + f" {w}" for a, b, w in grp) + ".")
+            out.append("")
+        hz = X.get("skill_horizon")
+        v0 = (C.get(days[0]) or {}).get("tmax") or {}
+        if v0.get("s_clim"):
+            out.append(f"Gegen die Klimatologie: Die Streuung des Höchstwerts beträgt heute {n(v0['s_total'], 1)} K, die "
+                       f"natürliche Streuung dieser Jahreszeit 1991–2020 {n(v0['s_clim'], 1)} K. "
+                       + (("Schon heute ist die Unsicherheit fast so gross wie die natürliche Streuung der Jahreszeit; die "
+                           "Temperaturprognose ist für die Riederalp derzeit wenig aussagekräftig." if hz == days[0] else
+                           f"Ab {dshort(hz)} erreicht die Prognoseunsicherheit 80 % der klimatologischen Streuung; ab dann "
+                           "sagt die Prognose kaum mehr als das langjährige Mittel.") if hz else
+                          "Bis zum Ende des Zeitraums bleibt die Prognose deutlich schärfer als die Klimatologie."))
+            out.append("")
+    out += ["<!--CHART:bereiche-->", ""]
+    return out
+
+
+def svg_ranges(X):
+    """Höchst- und Tiefstwert: kalibrierter Bereich als Balken, Unsicherheit der Grenzen als Fehlerbalken."""
+    C = (X.get("calt") or {}).get("riederalp") or {}
+    days = [d for d in X["days"] if (C.get(d) or {}).get("tmax")]
+    if len(days) < 2:
+        return None
+    W, H, L_, R_, T_, B_ = 420, 300, 34, 8, 26, 28
+    vals = []
+    for d in days:
+        for var in ("tmax", "tmin"):
+            v = C[d].get(var)
+            if v:
+                vals += [v["lo_ci"][0] or v["lo"], v["hi_ci"][1] or v["hi"]]
+    ylo, yhi = math.floor(min(vals)) - 1, math.ceil(max(vals)) + 1
+    Y_ = lambda t: T_ + (yhi - t) / (yhi - ylo) * (H - T_ - B_)
+    bw = (W - L_ - R_) / len(days)
+    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Temperaturbereiche Riederalp mit Unsicherheit">']
+    step = 2 if yhi - ylo <= 14 else 5
+    for t in range(int(math.ceil(ylo / step) * step), yhi + 1, step):
+        p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{Y_(t):.1f}" y2="{Y_(t):.1f}" class="{"zero" if t == 0 else "grid"}"/>'
+                 f'<text x="{L_ - 4}" y="{Y_(t) + 4:.1f}" class="ax" text-anchor="end">{n(t)}</text>')
+    for k, d in enumerate(days):
+        x0 = L_ + k * bw
+        p.append(f'<text x="{x0 + bw / 2:.1f}" y="{T_ - 10}" class="ax" text-anchor="middle">{WDS[d.weekday()]} {d.day}.</text>')
+        for var, off, cls in (("tmin", 0.28, "rmin"), ("tmax", 0.62, "rmax")):
+            v = C[d].get(var)
+            if not v:
+                continue
+            xc = x0 + bw * off
+            p.append(f'<rect x="{xc - 6:.1f}" y="{Y_(v["hi"]):.1f}" width="12" height="{max(1, Y_(v["lo"]) - Y_(v["hi"])):.1f}" '
+                     f'rx="2" class="{cls}"/>')
+            for a, b in (v["lo_ci"], v["hi_ci"]):
+                if a is not None and b is not None:
+                    p.append(f'<line x1="{xc - 8:.1f}" x2="{xc + 8:.1f}" y1="{Y_(a):.1f}" y2="{Y_(a):.1f}" class="whisk"/>'
+                             f'<line x1="{xc - 8:.1f}" x2="{xc + 8:.1f}" y1="{Y_(b):.1f}" y2="{Y_(b):.1f}" class="whisk"/>'
+                             f'<line x1="{xc:.1f}" x2="{xc:.1f}" y1="{Y_(a):.1f}" y2="{Y_(b):.1f}" class="whisk"/>')
+            p.append(f'<circle cx="{xc:.1f}" cy="{Y_(v["center"]):.1f}" r="2.6" class="rmid"/>')
+    p.append("</svg>")
+    cap = ("Kalibrierte Bereiche (10. bis 90. Perzentil) für Tiefstwert (blau) und Höchstwert (rot) auf der Riederalp, "
+           "Punkt: Mittelwert nach Eichung. Die schmalen Querstriche zeigen, wie genau die Ober- und Untergrenze selbst "
+           "bestimmt sind (80-%-Intervall aus Bootstrap über Ensembles und Verifikation).")
+    return "\n".join(p), cap
+
+
+def svg_budget(X):
+    """Unsicherheitsbudget des Höchstwerts: Varianzanteile pro Tag, Linie: klimatologische Streuung."""
+    C = (X.get("calt") or {}).get("riederalp") or {}
+    days = [d for d in X["days"] if (C.get(d) or {}).get("tmax")]
+    if len(days) < 2:
+        return None
+    W, H, L_, R_, T_, B_ = 420, 260, 34, 8, 26, 30
+    tot = [C[d]["tmax"]["s_total"] for d in days]
+    cl = [C[d]["tmax"]["s_clim"] for d in days if C[d]["tmax"]["s_clim"]]
+    ymax = max(tot + cl + [1.0]) * 1.15
+    Y_ = lambda s: T_ + (ymax - s) / ymax * (H - T_ - B_)
+    bw = (W - L_ - R_) / len(days)
+    comps = (("s_within", "bw1"), ("s_between", "bw2"), ("s_rep", "bw3"), ("s_cal_extra", "bw4"))
+    p = [f'<svg viewBox="0 0 {W} {H}" class="chart" role="img" aria-label="Unsicherheitsbudget Höchstwert Riederalp">']
+    for s in range(0, int(ymax) + 1):
+        p.append(f'<line x1="{L_}" x2="{W - R_}" y1="{Y_(s):.1f}" y2="{Y_(s):.1f}" class="grid"/>'
+                 f'<text x="{L_ - 4}" y="{Y_(s) + 4:.1f}" class="ax" text-anchor="end">{s}</text>')
+    for k, d in enumerate(days):
+        v = C[d]["tmax"]
+        var_tot = sum(v[c] ** 2 for c, _ in comps) or 1e-9
+        x = L_ + k * bw + bw * 0.2
+        y_base = Y_(0)
+        for c, cls in comps:
+            h = (v[c] ** 2 / var_tot) * (Y_(0) - Y_(v["s_total"]))
+            if h > 0.3:
+                p.append(f'<rect x="{x:.1f}" y="{y_base - h:.1f}" width="{bw * 0.6:.1f}" height="{h:.1f}" class="{cls}"/>')
+            y_base -= h
+        p.append(f'<text x="{x + bw * 0.3:.1f}" y="{Y_(v["s_total"]) - 4:.1f}" class="ax" text-anchor="middle">'
+                 f'{n(v["s_total"], 1)}</text>'
+                 f'<text x="{x + bw * 0.3:.1f}" y="{H - 10}" class="ax" text-anchor="middle">{WDS[d.weekday()]} {d.day}.</text>')
+    if cl:
+        pts = [(L_ + k * bw + bw * 0.5, Y_(C[d]["tmax"]["s_clim"])) for k, d in enumerate(days) if C[d]["tmax"]["s_clim"]]
+        p.append(f'<polyline points="{" ".join(f"{a:.1f},{b:.1f}" for a, b in pts)}" class="climline"/>')
+    p.append(f'<text x="{L_}" y="{T_ - 10}" class="ax">Streuung des Höchstwerts in K</text></svg>')
+    cap = ("Unsicherheitsbudget des Höchstwerts auf der Riederalp: Balkenhöhe = gesamte Streuung (Standardabweichung, "
+           "nach Eichung), aufgeteilt nach Varianzanteilen: Wetterlage innerhalb der Ensembles (dunkelblau), Uneinigkeit "
+           "zwischen den Systemen (hellblau), Gitterzelle und Gelände (braun), zusätzliche Breite aus der Eichung an "
+           "Messungen (rot). Gestrichelt: natürliche Streuung der Jahreszeit 1991–2020.")
+    return "\n".join(p), cap
 
 
 # ================================================================ Karten
@@ -5482,6 +6153,13 @@ svg .med{fill:none;stroke:var(--ice);stroke-width:1.6}
 svg .det0{fill:none;stroke:var(--warm);stroke-width:1.4}
 svg .det1{fill:none;stroke:var(--contour);stroke-width:1.2;stroke-dasharray:4 3}
 svg .bar{fill:var(--rain);opacity:.75}
+svg .rmax{fill:var(--warm);opacity:.35;stroke:var(--warm);stroke-width:1}
+svg .rmin{fill:var(--ice);opacity:.35;stroke:var(--ice);stroke-width:1}
+svg .whisk{stroke:var(--ink);stroke-width:1.3}
+svg .rmid{fill:var(--ink)}
+svg .bw1{fill:var(--ice)}svg .bw2{fill:var(--ice);opacity:.45}svg .bw3{fill:var(--contour);opacity:.8}
+svg .bw4{fill:var(--warm);opacity:.75}
+svg .climline{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-dasharray:5 4}
 svg .snowbar{fill:var(--ice);opacity:.55}
 svg .sfh{fill:none;stroke:var(--ice);stroke-width:1;opacity:.55}
 svg .sfhw{fill:none;stroke:var(--ice);stroke-width:2.8}
@@ -5646,6 +6324,10 @@ def main():
         sys.exit(1)
     X = diagnose(D, days, now)
     diagnose_extra(D, X)
+    try:
+        diagnose_uncertainty(D, X)
+    except Exception as e:  # noqa: BLE001 - Unsicherheitsanalyse darf den Bericht nie verhindern
+        log(f"Unsicherheitsanalyse ({type(e).__name__}: {e})")
     md = build_report(X)
     narr = claude_narrative(X, md) if args.claude else None
     if narr:
@@ -5654,6 +6336,13 @@ def main():
         md = md.replace("<!--NARRATIV-->", block)
     charts = {"profil": svg_profile(X), "fan": svg_fan(X), "schnee": svg_snow(X)}
     charts.update(build_maps(D, X, args.cache))
+    for key, fn in (("bereiche", svg_ranges), ("budget", svg_budget)):
+        try:
+            res = fn(X)
+            if res:
+                charts[key] = res
+        except Exception as e:  # noqa: BLE001
+            log(f"Grafik {key} ({type(e).__name__}: {e})")
     os.makedirs(args.out, exist_ok=True)
     md_clean = re.sub(r"<!--[^>]*-->\n?", "", md)
     with open(os.path.join(args.out, "bericht.md"), "w", encoding="utf-8") as f:
